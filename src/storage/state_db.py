@@ -20,7 +20,7 @@ from typing import List, Optional
 
 from src.layer3_strategy.models import Opportunity, PaperPosition
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 
 SCHEMA_SQL = """
@@ -52,6 +52,32 @@ CREATE TABLE IF NOT EXISTS kill_switch_events (
     reset_by TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_kill_switch_occurred ON kill_switch_events(occurred_at);
+
+-- Phase 3: paired (paper_expected vs live_actual) execution records for
+-- calibration analysis. One row per live fill.
+CREATE TABLE IF NOT EXISTS execution_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    opportunity_id TEXT NOT NULL,
+    detected_at TEXT NOT NULL,
+    executed_at TEXT NOT NULL,
+    paper_expected_profit_usd TEXT NOT NULL,
+    paper_profit_p05_usd TEXT NOT NULL,
+    paper_profit_p95_usd TEXT NOT NULL,
+    paper_expected_yes_px TEXT NOT NULL,
+    paper_expected_no_px TEXT NOT NULL,
+    live_actual_profit_usd TEXT,       -- NULL until resolved
+    live_fill_yes_px TEXT,
+    live_fill_no_px TEXT,
+    live_fill_latency_ms INTEGER,
+    live_partial_fill INTEGER,         -- bool
+    live_slippage_bps INTEGER,
+    within_p5_p95 INTEGER,             -- bool; NULL until resolved
+    divergence_bps INTEGER,
+    explanation TEXT,
+    gate TEXT NOT NULL,
+    provenance TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_execution_records_opp ON execution_records(opportunity_id);
 
 -- Phase 2: kill switch active state (one row per trigger). Persisted across restarts.
 CREATE TABLE IF NOT EXISTS kill_switch_state (
@@ -446,3 +472,95 @@ def any_kill_switch_tripped(conn: sqlite3.Connection) -> List[str]:
         "SELECT trigger FROM kill_switch_state WHERE tripped = 1"
     ).fetchall()
     return [r["trigger"] for r in rows]
+
+
+# ---------------- Phase 3: paired execution records ----------------
+
+def insert_execution_record(
+    conn: sqlite3.Connection,
+    *,
+    opportunity_id: str,
+    detected_at_iso: str,
+    executed_at_iso: str,
+    paper_expected: Decimal,
+    paper_p05: Decimal,
+    paper_p95: Decimal,
+    paper_yes_px: Decimal,
+    paper_no_px: Decimal,
+    live_profit: Optional[Decimal],
+    live_yes_px: Optional[Decimal],
+    live_no_px: Optional[Decimal],
+    live_latency_ms: Optional[int],
+    live_partial_fill: Optional[bool],
+    live_slippage_bps: Optional[int],
+    within_ci: Optional[bool],
+    divergence_bps: Optional[int],
+    gate: str,
+    provenance_json: str,
+) -> int:
+    """Write one paired record. Returns the new row id."""
+    cur = conn.execute(
+        """
+        INSERT INTO execution_records (
+            opportunity_id, detected_at, executed_at,
+            paper_expected_profit_usd, paper_profit_p05_usd, paper_profit_p95_usd,
+            paper_expected_yes_px, paper_expected_no_px,
+            live_actual_profit_usd, live_fill_yes_px, live_fill_no_px,
+            live_fill_latency_ms, live_partial_fill, live_slippage_bps,
+            within_p5_p95, divergence_bps,
+            gate, provenance
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            opportunity_id,
+            detected_at_iso,
+            executed_at_iso,
+            str(paper_expected),
+            str(paper_p05),
+            str(paper_p95),
+            str(paper_yes_px),
+            str(paper_no_px),
+            str(live_profit) if live_profit is not None else None,
+            str(live_yes_px) if live_yes_px is not None else None,
+            str(live_no_px) if live_no_px is not None else None,
+            live_latency_ms,
+            1 if live_partial_fill else 0 if live_partial_fill is not None else None,
+            live_slippage_bps,
+            1 if within_ci else 0 if within_ci is not None else None,
+            divergence_bps,
+            gate,
+            provenance_json,
+        ),
+    )
+    return cur.lastrowid
+
+
+def execution_records_since(conn: sqlite3.Connection, since_iso: str) -> List[dict]:
+    rows = conn.execute(
+        "SELECT * FROM execution_records WHERE executed_at >= ? ORDER BY executed_at",
+        (since_iso,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def calibration_coverage_in_window(
+    conn: sqlite3.Connection, since_iso: str
+) -> Optional[float]:
+    """Fraction of resolved execution records whose live_pnl fell in [p05, p95].
+
+    Returns None if there are no resolved records in the window.
+    """
+    row = conn.execute(
+        """
+        SELECT
+            SUM(CASE WHEN within_p5_p95 = 1 THEN 1 ELSE 0 END) AS within,
+            SUM(CASE WHEN within_p5_p95 IS NOT NULL THEN 1 ELSE 0 END) AS resolved
+        FROM execution_records
+        WHERE executed_at >= ?
+        """,
+        (since_iso,),
+    ).fetchone()
+    resolved = (row["resolved"] or 0)
+    if resolved == 0:
+        return None
+    return (row["within"] or 0) / resolved
