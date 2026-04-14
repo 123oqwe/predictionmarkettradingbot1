@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arb-agent"
+version = "0.1.0"
+description = "Prediction market arbitrage agent — Phase 0 MVP"
+requires-python = ">=3.9"
+dependencies = [
+  "pydantic>=2.5,<3",
+  "pyarrow>=14",
+  "aiohttp>=3.9",
+  "pyyaml>=6",
+  "structlog>=24",
+  "typing-extensions>=4.9",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.4",
+  "pytest-asyncio>=0.21",
+  "pytest-cov>=4.1",
+  "ruff>=0.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-v --tb=short"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "B", "C4", "SIM"]
+ignore = ["E501", "B008", "SIM105", "SIM117", "F841"]

@@ -1,0 +1,39 @@
+# Phase 0 config. Thresholds, caps, operational params.
+# All Decimal fields parsed as strings to avoid float contamination.
+
+mode: paper  # paper | live. Phase 0 is paper-only.
+
+polymarket:
+  clob_base_url: "https://clob.polymarket.com"
+  gamma_base_url: "https://gamma-api.polymarket.com"
+  poll_interval_seconds: 5
+  request_timeout_seconds: 10
+  max_concurrent_requests: 8
+  # Typical per-trade gas cost on Polygon, USD equivalent. Tune based on observation.
+  gas_estimate_usd: "0.20"
+  # Conservative fee estimate in basis points (Polymarket is currently 0 bps maker/taker
+  # on CLOB, but kept here for flexibility and future fee tier changes).
+  fee_bps: 0
+
+storage:
+  snapshots_dir: "data/snapshots"
+  state_db_path: "data/state.db"
+  parquet_flush_interval_seconds: 30
+
+strategy:
+  intra_market:
+    min_annualized_return: "0.20"       # 20% annualized minimum
+    min_days_to_resolution: "5"         # Reject trades resolving in < 5 days (annualization noise)
+    min_trade_size_contracts: "5"
+    max_trade_size_contracts: "1000"
+    min_market_liquidity_usd: "100"     # Skip dead markets
+    stale_snapshot_threshold_seconds: 10
+
+allocation:
+  total_capital_usd: "1000"
+  max_capital_per_trade_usd: "100"
+  max_capital_per_event_usd: "150"
+
+execution:
+  paper:
+    resolution_poll_interval_seconds: 3600  # Check for resolutions hourly

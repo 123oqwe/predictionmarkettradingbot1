@@ -1,0 +1,35 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.env
+.env.local
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.DS_Store
+.idea/
+.vscode/
+
+# Project-specific
+data/
+*.parquet
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+logs/
+reports/
+
+# Secrets
+config.local.yaml
+*.secret
