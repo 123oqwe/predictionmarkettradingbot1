@@ -93,6 +93,32 @@ class AdverseSelectionConfig:
 
 
 @dataclass(frozen=True)
+class RiskRuleConfig:
+    mode: str  # 'disabled' | 'observe' | 'enforce'
+    params: Dict[str, Any]
+
+
+@dataclass(frozen=True)
+class RiskConfig:
+    default_mode: str
+    default_cooldown_seconds: int
+    rules: Dict[str, RiskRuleConfig]
+
+
+@dataclass(frozen=True)
+class MonitoringConfig:
+    health_port: int
+    metrics_persist_interval_seconds: int
+
+
+@dataclass(frozen=True)
+class TelegramConfig:
+    bot_token_env: str
+    chat_id_env: str
+    max_per_hour_non_critical: int
+
+
+@dataclass(frozen=True)
 class Config:
     mode: str
     polymarket: PolymarketConfig
@@ -105,6 +131,10 @@ class Config:
     kalshi: Optional[KalshiConfig] = None
     adverse_selection: Optional[AdverseSelectionConfig] = None
     event_map_path: Optional[str] = None
+    # Phase 2 additions.
+    risk: Optional[RiskConfig] = None
+    monitoring: Optional[MonitoringConfig] = None
+    telegram: Optional[TelegramConfig] = None
     raw: Dict[str, Any] = field(default_factory=dict)  # for hashing / provenance
 
 
@@ -156,6 +186,38 @@ def load_config(path: str | Path) -> Config:
             news_windows=windows,
         )
 
+    risk_cfg = None
+    if "risk" in raw:
+        r = raw["risk"]
+        rules_map: Dict[str, RiskRuleConfig] = {}
+        for rule_name, rule_body in (r.get("rules") or {}).items():
+            rules_map[rule_name] = RiskRuleConfig(
+                mode=str(rule_body.get("mode", r.get("default_mode", "observe"))),
+                params=dict(rule_body.get("params") or {}),
+            )
+        risk_cfg = RiskConfig(
+            default_mode=str(r.get("default_mode", "observe")),
+            default_cooldown_seconds=int(r.get("default_cooldown_seconds", 300)),
+            rules=rules_map,
+        )
+
+    monitoring_cfg = None
+    if "monitoring" in raw:
+        mon = raw["monitoring"]
+        monitoring_cfg = MonitoringConfig(
+            health_port=int(mon.get("health_port", 9100)),
+            metrics_persist_interval_seconds=int(mon.get("metrics_persist_interval_seconds", 30)),
+        )
+
+    telegram_cfg = None
+    if "telegram" in raw:
+        t = raw["telegram"]
+        telegram_cfg = TelegramConfig(
+            bot_token_env=str(t.get("bot_token_env", "TELEGRAM_BOT_TOKEN")),
+            chat_id_env=str(t.get("chat_id_env", "TELEGRAM_CHAT_ID")),
+            max_per_hour_non_critical=int(t.get("max_per_hour_non_critical", 5)),
+        )
+
     return Config(
         mode=raw["mode"],
         polymarket=PolymarketConfig(
@@ -192,5 +254,8 @@ def load_config(path: str | Path) -> Config:
         kalshi=kalshi_cfg,
         adverse_selection=adv,
         event_map_path=raw.get("event_map_path"),
+        risk=risk_cfg,
+        monitoring=monitoring_cfg,
+        telegram=telegram_cfg,
         raw=raw,
     )

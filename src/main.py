@@ -1,10 +1,9 @@
-"""Phase 0 + Phase 1 orchestrator.
+"""Phase 0 + Phase 1 + Phase 2 orchestrator.
 
-Wires Layers 1-4 plus Phase 1 additions: Kalshi fetcher, cross-market detection,
-adverse selection filters, daily report v2.
-
-Architectural test of Phase 1: this file gained Kalshi support and cross-market
-detection without Layers 2, 3, 4 changing. Layer 3 still pure. Layer 2 unchanged.
+Wires everything: layers 1-4, Kalshi, cross-market detection, adverse selection,
+and the full Phase 2 stack — monitoring, kill switch framework, reconciliation,
+Telegram alerts (stub mode when not configured), health endpoint, crash
+recovery with a state-loaded gate before the first scan cycle.
 
 Run:
     python -m src.main --config config.yaml
@@ -19,10 +18,11 @@ import sys
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import structlog
 
+from src.alerts.telegram import AlertLevel, TelegramAlerter, TelegramConfig
 from src.config import Config, load_config
 from src.layer1_data_recording.kalshi_fetcher import KalshiFetcher
 from src.layer1_data_recording.parquet_writer import DailyParquetWriter
@@ -41,8 +41,19 @@ from src.layer3_strategy.intra_market import StrategyContext, find_opportunities
 from src.layer3_strategy.models import Market, Opportunity
 from src.layer4_execution.paper import PaperExecutor
 from src.matching.event_map import EventMap, load_event_map
+from src.monitoring.http_server import HealthServer
+from src.monitoring.metrics import MetricsRegistry, persist_snapshot
 from src.provenance import build_bundle
 from src.reports import CycleReport, render_cycle
+from src.risk import rules as risk_rules
+from src.risk.policy import (
+    PolicyConfig,
+    PolicyEngine,
+    PolicyMode,
+    RuleConfig,
+    TriggerName,
+)
+from src.risk.recovery import perform_recovery
 from src.storage import state_db
 
 logger = structlog.get_logger(__name__)
@@ -77,6 +88,41 @@ def _topic_tags_for(opp: Opportunity, event_map: EventMap) -> List[str]:
         return []
     p = event_map.by_id(opp.event_id)
     return list(p.topic_tags) if p else []
+
+
+_NAME_TO_TRIGGER = {t.value: t for t in TriggerName}
+_RULES_BY_NAME = risk_rules.ALL_RULES
+
+
+def _build_policy_engine(
+    conn, cfg: Config, provenance_json: str, event_map_hash: str
+) -> Optional[PolicyEngine]:
+    if cfg.risk is None:
+        return None
+    pc = PolicyConfig(
+        rules={
+            _NAME_TO_TRIGGER[name]: RuleConfig(
+                name=_NAME_TO_TRIGGER[name],
+                mode=PolicyMode(rc.mode),
+                cooldown_seconds=cfg.risk.default_cooldown_seconds,
+            )
+            for name, rc in cfg.risk.rules.items()
+            if name in _NAME_TO_TRIGGER
+        },
+        default_mode=PolicyMode(cfg.risk.default_mode),
+        default_cooldown_seconds=cfg.risk.default_cooldown_seconds,
+    )
+    engine = PolicyEngine(conn, pc, provenance_json)
+    for name, rc in cfg.risk.rules.items():
+        if name not in _RULES_BY_NAME or name not in _NAME_TO_TRIGGER:
+            continue
+        params = dict(rc.params)
+        if name == "event_map_drift":
+            # Inject expected hash at startup; current_hash is refreshed each cycle.
+            params.setdefault("expected_hash", event_map_hash)
+            params.setdefault("current_hash", event_map_hash)
+        engine.register(_NAME_TO_TRIGGER[name], _RULES_BY_NAME[name], params)
+    return engine
 
 
 async def run(config_path: str) -> None:
@@ -156,6 +202,47 @@ async def run(config_path: str) -> None:
     cross_history = OpportunityHistory()
     news_windows = _build_news_windows(cfg)
 
+    # Phase 2: monitoring + risk + alerts + health.
+    metrics = MetricsRegistry()
+    policy = _build_policy_engine(conn, cfg, provenance_json, event_map.content_hash)
+
+    alerter = TelegramAlerter(
+        TelegramConfig(
+            bot_token=os.environ.get(cfg.telegram.bot_token_env) if cfg.telegram else None,
+            chat_id=os.environ.get(cfg.telegram.chat_id_env) if cfg.telegram else None,
+            max_per_hour_non_critical=(cfg.telegram.max_per_hour_non_critical if cfg.telegram else 5),
+        )
+    )
+
+    # Startup safety: perform_recovery reads kill-switch state; if tripped and
+    # enforced, refuse to scan until manually reset.
+    recovery = perform_recovery(conn)
+    logger.info(
+        "recovery",
+        safe_to_trade=recovery.safe_to_trade,
+        tripped=recovery.tripped_triggers,
+        reconcile_errors=recovery.reconcile_errors,
+        open_positions=recovery.open_positions,
+    )
+    if not recovery.safe_to_trade:
+        await alerter.send(
+            AlertLevel.CRITICAL,
+            f"Startup halted: tripped={recovery.tripped_triggers} reconcile_errors={recovery.reconcile_errors}. "
+            f"Reset via scripts/kill_switch_reset.py before resuming.",
+        )
+
+    health: Optional[HealthServer] = None
+    if cfg.monitoring is not None:
+        health = HealthServer(
+            metrics, conn, mode=cfg.mode, port=cfg.monitoring.health_port
+        )
+        try:
+            await health.start()
+            logger.info("health_endpoint_started", port=cfg.monitoring.health_port)
+        except Exception as e:
+            logger.warning("health_endpoint_failed", error=str(e))
+            health = None
+
     stop = asyncio.Event()
 
     def _signal_handler(*_):
@@ -194,16 +281,24 @@ async def run(config_path: str) -> None:
             cycle.markets_polymarket = len(poly_markets)
             cycle.markets_kalshi = len(kalshi_markets)
 
+            # Layer heartbeats — every successful fetch confirms the fetcher is alive.
+            if poly_markets:
+                metrics.heartbeat("polymarket")
+            if kalshi_markets:
+                metrics.heartbeat("kalshi")
+
             if poly_markets:
                 try:
                     await poly_writer.write_many(poly_markets)
                 except Exception as e:
                     logger.error("polymarket_parquet_write_failed", error=str(e))
+                    metrics.record_api_error("polymarket")
             if kalshi_markets and kalshi_writer is not None:
                 try:
                     await kalshi_writer.write_many(kalshi_markets)
                 except Exception as e:
                     logger.error("kalshi_parquet_write_failed", error=str(e))
+                    metrics.record_api_error("kalshi")
 
             intra_opps = find_opportunities(poly_markets, intra_ctx) if poly_markets else []
             cycle.intra_detected = intra_opps
@@ -250,32 +345,64 @@ async def run(config_path: str) -> None:
                 cycle.intra_passed = intra_opps
                 cycle.cross_passed = cross_opps
 
-            # Allocate intra only. Cross-market live trading is gated to Phase 3.
-            reserved = state_db.total_capital_locked(conn)
-            markets_by_id: Dict[str, Market] = {m.market_id: m for m in poly_markets}
-            allocations = allocate_capital(
-                cycle.intra_passed,
-                markets_by_id,
-                intra_ctx,
-                cfg.allocation,
-                reserved_capital_usd=reserved,
+            # Metrics aggregation.
+            metrics.opportunities_detected_total.inc(len(intra_opps) + len(cross_opps))
+            metrics.opportunities_passed_total.inc(
+                len(cycle.intra_passed) + len(cycle.cross_passed)
             )
+            metrics.opportunities_per_minute.add(len(intra_opps) + len(cross_opps))
+            metrics.rolling_pnl_24h_usd.set(float(state_db.realized_pnl_total(conn)))
+            metrics.capital_utilization_pct.set(
+                float(state_db.total_capital_locked(conn) / cfg.allocation.total_capital_usd)
+                if cfg.allocation.total_capital_usd > 0
+                else 0.0
+            )
+
+            # Evaluate kill switches. Any tripped switch halts trading this cycle.
+            if policy is not None:
+                policy.evaluate_all(metrics)
+            halted = state_db.any_kill_switch_tripped(conn)
+
+            if halted:
+                logger.warning("trading_halted", tripped=halted)
+                # Skip allocation + fills but keep recording + reporting.
+                allocations = []
+            else:
+                reserved = state_db.total_capital_locked(conn)
+                markets_by_id: Dict[str, Market] = {m.market_id: m for m in poly_markets}
+                allocations = allocate_capital(
+                    cycle.intra_passed,
+                    markets_by_id,
+                    intra_ctx,
+                    cfg.allocation,
+                    reserved_capital_usd=reserved,
+                )
             cycle.allocations_count = len(allocations)
 
-            for alloc in allocations:
-                market = markets_by_id.get(alloc.opportunity.market_id)
-                if market is None:
-                    continue
-                try:
-                    executor.fill_with_resolution(alloc, market.resolution_date)
-                    cycle.capital_allocated_this_cycle += alloc.allocated_capital_usd
-                except Exception as e:
-                    logger.error("paper_fill_failed", error=str(e))
+            if not halted:
+                for alloc in allocations:
+                    market = markets_by_id.get(alloc.opportunity.market_id)
+                    if market is None:
+                        continue
+                    try:
+                        executor.fill_with_resolution(alloc, market.resolution_date)
+                        cycle.capital_allocated_this_cycle += alloc.allocated_capital_usd
+                        metrics.trades_executed_total.inc()
+                    except Exception as e:
+                        logger.error("paper_fill_failed", error=str(e))
+                        metrics.exceptions_total.inc()
+                        metrics.exceptions_per_5min.add(1)
 
             executor.resolve_due_positions()
 
             for opp in cycle.cross_passed:
                 state_db.write_opportunity(conn, opp, provenance_json)
+
+            # Persist a metrics snapshot each cycle.
+            try:
+                persist_snapshot(conn, metrics, now=now)
+            except Exception as e:
+                logger.warning("metrics_persist_failed", error=str(e))
 
             now_str = now.strftime("%Y-%m-%d %H:%M:%S")
             header = (
@@ -295,6 +422,11 @@ async def run(config_path: str) -> None:
             except asyncio.TimeoutError:
                 pass
     finally:
+        if health is not None:
+            try:
+                await health.stop()
+            except Exception:
+                pass
         await poly_writer.close()
         if kalshi_writer is not None:
             await kalshi_writer.close()

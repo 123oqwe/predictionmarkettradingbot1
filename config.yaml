@@ -60,6 +60,52 @@ adverse_selection:
       blackout_minutes_before: 15
       blackout_minutes_after: 60
 
+# Phase 2: kill switch rules. Start every rule in observe mode; move to enforce
+# only after 48+h of clean observation in production (doc discipline).
+risk:
+  default_mode: observe
+  default_cooldown_seconds: 300
+  rules:
+    daily_loss_exceeded:
+      mode: enforce
+      params: { max_daily_loss_usd: 50.0 }
+    abnormal_price_jump:
+      mode: observe
+      params: { max_price_jump_pct: 0.20 }
+    api_disconnect:
+      mode: enforce
+      params: { max_silence_seconds: 120 }
+    clock_drift:
+      mode: observe
+      params: { max_drift_seconds: 2.0 }
+    unhandled_exception_rate:
+      mode: observe
+      params: { max_per_5min: 5 }
+    position_mismatch:
+      mode: observe
+      params: {}
+    usdc_depeg:
+      mode: enforce
+      params: { min_price_usd: 0.995 }
+    layer_stall:
+      mode: observe
+      params: { max_silence_seconds: 180 }
+    manual:
+      mode: enforce
+      params: { kill_file_path: /tmp/arb_agent.kill }
+    event_map_drift:
+      mode: observe
+      params: {}
+
+monitoring:
+  health_port: 9100
+  metrics_persist_interval_seconds: 30
+
+telegram:
+  bot_token_env: TELEGRAM_BOT_TOKEN
+  chat_id_env: TELEGRAM_CHAT_ID
+  max_per_hour_non_critical: 5
+
 allocation:
   total_capital_usd: "1000"
   max_capital_per_trade_usd: "100"

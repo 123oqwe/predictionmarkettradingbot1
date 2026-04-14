@@ -20,13 +20,47 @@ from typing import List, Optional
 
 from src.layer3_strategy.models import Opportunity, PaperPosition
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER PRIMARY KEY,
     applied_at TEXT NOT NULL
+);
+
+-- Phase 2: monitoring metrics (time-series, append-only).
+CREATE TABLE IF NOT EXISTS metrics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    recorded_at TEXT NOT NULL,
+    name TEXT NOT NULL,
+    value REAL NOT NULL,
+    labels TEXT  -- JSON string
+);
+CREATE INDEX IF NOT EXISTS ix_metrics_name_time ON metrics(name, recorded_at);
+
+-- Phase 2: kill switch state. One row per trip event.
+CREATE TABLE IF NOT EXISTS kill_switch_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    occurred_at TEXT NOT NULL,
+    trigger TEXT NOT NULL,
+    mode TEXT NOT NULL,           -- 'observe' or 'enforce'
+    enforced INTEGER NOT NULL DEFAULT 0,
+    reason TEXT NOT NULL,
+    provenance TEXT NOT NULL,
+    reset_at TEXT,                -- when manually reset (NULL until then)
+    reset_by TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_kill_switch_occurred ON kill_switch_events(occurred_at);
+
+-- Phase 2: kill switch active state (one row per trigger). Persisted across restarts.
+CREATE TABLE IF NOT EXISTS kill_switch_state (
+    trigger TEXT PRIMARY KEY,
+    tripped INTEGER NOT NULL DEFAULT 0,  -- 1 = currently halting trading
+    tripped_at TEXT,
+    reason TEXT,
+    last_observe_at TEXT,
+    last_enforce_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS opportunities (
@@ -104,10 +138,15 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
 
 
 def init_schema(conn: sqlite3.Connection) -> None:
-    """Create tables if absent, record schema version."""
+    """Create tables if absent, advance schema_version monotonically.
+
+    Migration is purely additive in Phase 0→2: we only added new tables, no
+    column changes. CREATE TABLE IF NOT EXISTS handles that. The version row is
+    updated to CURRENT_SCHEMA_VERSION on first init or if it lags behind.
+    """
     conn.executescript(SCHEMA_SQL)
     row = conn.execute("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1").fetchone()
-    if row is None:
+    if row is None or row["version"] < CURRENT_SCHEMA_VERSION:
         conn.execute(
             "INSERT INTO schema_version(version, applied_at) VALUES(?, datetime('now'))",
             (CURRENT_SCHEMA_VERSION,),
@@ -282,3 +321,128 @@ def _row_to_position(row) -> PaperPosition:
         realized_pnl_usd=Decimal(realized) if realized is not None else None,
         resolved_at=datetime.fromisoformat(resolved_at) if resolved_at else None,
     )
+
+
+# ---------------- Phase 2: monitoring metrics ----------------
+
+def write_metric(
+    conn: sqlite3.Connection,
+    name: str,
+    value: float,
+    recorded_at_iso: str,
+    labels_json: Optional[str] = None,
+) -> None:
+    conn.execute(
+        "INSERT INTO metrics(recorded_at, name, value, labels) VALUES(?, ?, ?, ?)",
+        (recorded_at_iso, name, float(value), labels_json),
+    )
+
+
+def latest_metric(conn: sqlite3.Connection, name: str) -> Optional[float]:
+    row = conn.execute(
+        "SELECT value FROM metrics WHERE name = ? ORDER BY id DESC LIMIT 1",
+        (name,),
+    ).fetchone()
+    return float(row["value"]) if row else None
+
+
+def metrics_in_window(
+    conn: sqlite3.Connection, name: str, since_iso: str
+) -> list:
+    rows = conn.execute(
+        "SELECT recorded_at, value FROM metrics WHERE name = ? AND recorded_at >= ? ORDER BY id",
+        (name, since_iso),
+    ).fetchall()
+    return [(r["recorded_at"], float(r["value"])) for r in rows]
+
+
+def gc_metrics_older_than(conn: sqlite3.Connection, before_iso: str) -> int:
+    """Drop metrics older than `before_iso`. Returns rows deleted."""
+    cur = conn.execute("DELETE FROM metrics WHERE recorded_at < ?", (before_iso,))
+    return cur.rowcount
+
+
+# ---------------- Phase 2: kill switch state ----------------
+
+def kill_switch_get_state(conn: sqlite3.Connection, trigger: str) -> Optional[dict]:
+    row = conn.execute(
+        "SELECT * FROM kill_switch_state WHERE trigger = ?", (trigger,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def kill_switch_record_observation(
+    conn: sqlite3.Connection, trigger: str, reason: str, occurred_at_iso: str, provenance_json: str
+) -> None:
+    """Record an observe-mode trip (would-have-fired event). Does NOT halt trading."""
+    conn.execute(
+        """
+        INSERT INTO kill_switch_events(occurred_at, trigger, mode, enforced, reason, provenance)
+        VALUES(?, ?, 'observe', 0, ?, ?)
+        """,
+        (occurred_at_iso, trigger, reason, provenance_json),
+    )
+    conn.execute(
+        """
+        INSERT INTO kill_switch_state(trigger, tripped, last_observe_at)
+        VALUES(?, 0, ?)
+        ON CONFLICT(trigger) DO UPDATE SET last_observe_at = excluded.last_observe_at
+        """,
+        (trigger, occurred_at_iso),
+    )
+
+
+def kill_switch_enforce(
+    conn: sqlite3.Connection, trigger: str, reason: str, occurred_at_iso: str, provenance_json: str
+) -> None:
+    """Record enforcement event AND mark the trigger active. Halts trading."""
+    conn.execute(
+        """
+        INSERT INTO kill_switch_events(occurred_at, trigger, mode, enforced, reason, provenance)
+        VALUES(?, ?, 'enforce', 1, ?, ?)
+        """,
+        (occurred_at_iso, trigger, reason, provenance_json),
+    )
+    conn.execute(
+        """
+        INSERT INTO kill_switch_state(trigger, tripped, tripped_at, reason, last_enforce_at)
+        VALUES(?, 1, ?, ?, ?)
+        ON CONFLICT(trigger) DO UPDATE SET
+            tripped = 1,
+            tripped_at = excluded.tripped_at,
+            reason = excluded.reason,
+            last_enforce_at = excluded.last_enforce_at
+        """,
+        (trigger, occurred_at_iso, reason, occurred_at_iso),
+    )
+
+
+def kill_switch_reset(
+    conn: sqlite3.Connection, trigger: str, reset_by: str, reset_at_iso: str
+) -> bool:
+    """Manual reset. Returns True if a tripped trigger was cleared, False if it
+    was already clear (or unknown)."""
+    state = kill_switch_get_state(conn, trigger)
+    if not state or not state.get("tripped"):
+        return False
+    conn.execute(
+        "UPDATE kill_switch_state SET tripped = 0, reason = NULL, tripped_at = NULL WHERE trigger = ?",
+        (trigger,),
+    )
+    conn.execute(
+        """
+        UPDATE kill_switch_events
+        SET reset_at = ?, reset_by = ?
+        WHERE trigger = ? AND enforced = 1 AND reset_at IS NULL
+        """,
+        (reset_at_iso, reset_by, trigger),
+    )
+    return True
+
+
+def any_kill_switch_tripped(conn: sqlite3.Connection) -> List[str]:
+    """Return list of trigger names currently halting trading."""
+    rows = conn.execute(
+        "SELECT trigger FROM kill_switch_state WHERE tripped = 1"
+    ).fetchall()
+    return [r["trigger"] for r in rows]
