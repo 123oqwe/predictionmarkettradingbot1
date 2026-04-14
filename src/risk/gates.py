@@ -71,25 +71,68 @@ DEFAULT_GATE_CONFIGS = {
 
 @dataclass
 class GateState:
-    """Running state. Persisted in SQLite as serialized fields.
+    """Running state. Persisted in SQLite as a singleton row.
 
-    The orchestrator owns one of these. Each cycle it calls evaluate_for_graduation
-    to see if conditions for advancing are met.
+    The orchestrator owns one of these. Each cycle it calls
+    evaluate_for_graduation to see if conditions for advancing are met.
+    Every mutating method also writes to the DB so a process crash or
+    restart doesn't lose the gate counters.
+
+    Construct with `load_or_init(conn)` in production; pass `conn=None` for
+    tests that don't need persistence.
     """
 
     current_gate: Gate = Gate.GATE_1
     gate_entered_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     successful_fills_at_gate: int = 0
     calibration_coverage_recent: Optional[float] = None
+    _conn: object = None  # sqlite3.Connection or None
 
     def days_at_gate(self, now: datetime) -> float:
         return (now - self.gate_entered_at).total_seconds() / 86400.0
 
     def record_fill(self) -> None:
         self.successful_fills_at_gate += 1
+        self._persist()
 
     def set_calibration_coverage(self, coverage: float) -> None:
         self.calibration_coverage_recent = coverage
+        self._persist()
+
+    def _persist(self) -> None:
+        if self._conn is None:
+            return
+        from src.storage import state_db
+
+        state_db.save_gate_state(
+            self._conn,
+            current_gate=self.current_gate.value,
+            gate_entered_at_iso=self.gate_entered_at.isoformat(),
+            successful_fills=self.successful_fills_at_gate,
+            calibration_coverage=self.calibration_coverage_recent,
+            updated_at_iso=datetime.now(timezone.utc).isoformat(),
+        )
+
+    @classmethod
+    def load_or_init(cls, conn) -> "GateState":
+        """Read the persisted state from SQLite, or create a fresh Gate 1 state."""
+        from src.storage import state_db
+
+        row = state_db.load_gate_state(conn)
+        if row is None:
+            s = cls(_conn=conn)
+            s._persist()
+            return s
+        entered = datetime.fromisoformat(row["gate_entered_at"])
+        if entered.tzinfo is None:
+            entered = entered.replace(tzinfo=timezone.utc)
+        return cls(
+            current_gate=Gate(row["current_gate"]),
+            gate_entered_at=entered,
+            successful_fills_at_gate=int(row["successful_fills_at_gate"]),
+            calibration_coverage_recent=row["calibration_coverage_recent"],
+            _conn=conn,
+        )
 
     def config(
         self, configs: Optional[dict] = None
@@ -132,3 +175,4 @@ class GateState:
         self.gate_entered_at = now
         self.successful_fills_at_gate = 0
         self.calibration_coverage_recent = None
+        self._persist()

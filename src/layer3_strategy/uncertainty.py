@@ -70,6 +70,54 @@ class OpportunityUncertainty:
     profit_p95_usd: Decimal
 
 
+def bootstrap_inputs_from_db(conn) -> UncertaintyInputs:
+    """Compute UncertaintyInputs from paired live/paper records in SQLite.
+
+    Preference order:
+      1. If we have ≥20 resolved execution_records → use them.
+      2. Else if we have resolved paper_trades → derive synthetic slippage
+         assumption (only partial fill distribution is meaningful here).
+      3. Else → default_pre_live() priors.
+
+    Returns a fresh UncertaintyInputs each call. Cheap enough to run daily.
+    """
+
+    rows = conn.execute(
+        """
+        SELECT live_slippage_bps, live_partial_fill, paper_expected_profit_usd,
+               live_actual_profit_usd
+        FROM execution_records
+        WHERE live_actual_profit_usd IS NOT NULL
+        ORDER BY id DESC
+        LIMIT 500
+        """
+    ).fetchall()
+
+    if len(rows) >= 20:
+        slippage = [r["live_slippage_bps"] for r in rows if r["live_slippage_bps"] is not None]
+        fills = [0.5 if r["live_partial_fill"] == 1 else 1.0 for r in rows]
+        # Fee overrun: derive from PnL divergence against expected, attributing
+        # ~10% of the gap to fees. Crude but better than zero prior once data exists.
+        fee_over = []
+        for r in rows:
+            try:
+                expected = float(r["paper_expected_profit_usd"])
+                actual = float(r["live_actual_profit_usd"])
+                if expected > 0:
+                    gap_pct = (expected - actual) / expected
+                    fee_over.append(max(0, gap_pct * 10))  # in bps, rough
+            except (TypeError, ValueError):
+                continue
+        return UncertaintyInputs(
+            slippage_bps_samples=slippage or [0],
+            fill_rate_samples=fills,
+            fee_overrun_bps_samples=fee_over or [0],
+        )
+
+    # Fall back to pre-live priors.
+    return UncertaintyInputs.default_pre_live()
+
+
 def _percentile(samples: List[float], p: float) -> float:
     if not samples:
         return 0.0

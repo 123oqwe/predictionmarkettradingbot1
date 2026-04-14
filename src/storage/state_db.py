@@ -20,7 +20,7 @@ from typing import List, Optional
 
 from src.layer3_strategy.models import Opportunity, PaperPosition
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 
 SCHEMA_SQL = """
@@ -78,6 +78,17 @@ CREATE TABLE IF NOT EXISTS execution_records (
     provenance TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_execution_records_opp ON execution_records(opportunity_id);
+
+-- Phase 3 fix: persist gate state across restarts. Single-row table; upserts
+-- each time the orchestrator advances a gate or records a fill.
+CREATE TABLE IF NOT EXISTS gate_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),  -- singleton
+    current_gate TEXT NOT NULL,
+    gate_entered_at TEXT NOT NULL,
+    successful_fills_at_gate INTEGER NOT NULL DEFAULT 0,
+    calibration_coverage_recent REAL,
+    updated_at TEXT NOT NULL
+);
 
 -- Phase 2: kill switch active state (one row per trigger). Persisted across restarts.
 CREATE TABLE IF NOT EXISTS kill_switch_state (
@@ -541,6 +552,49 @@ def execution_records_since(conn: sqlite3.Connection, since_iso: str) -> List[di
         (since_iso,),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------------- Phase 3 fix: gate state persistence ----------------
+
+def save_gate_state(
+    conn: sqlite3.Connection,
+    *,
+    current_gate: str,
+    gate_entered_at_iso: str,
+    successful_fills: int,
+    calibration_coverage: Optional[float],
+    updated_at_iso: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO gate_state(
+            id, current_gate, gate_entered_at, successful_fills_at_gate,
+            calibration_coverage_recent, updated_at
+        ) VALUES (1, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            current_gate = excluded.current_gate,
+            gate_entered_at = excluded.gate_entered_at,
+            successful_fills_at_gate = excluded.successful_fills_at_gate,
+            calibration_coverage_recent = excluded.calibration_coverage_recent,
+            updated_at = excluded.updated_at
+        """,
+        (
+            current_gate,
+            gate_entered_at_iso,
+            int(successful_fills),
+            float(calibration_coverage) if calibration_coverage is not None else None,
+            updated_at_iso,
+        ),
+    )
+
+
+def load_gate_state(conn: sqlite3.Connection) -> Optional[dict]:
+    row = conn.execute(
+        "SELECT * FROM gate_state WHERE id = 1"
+    ).fetchone()
+    if row is None:
+        return None
+    return dict(row)
 
 
 def calibration_coverage_in_window(

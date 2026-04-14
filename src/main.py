@@ -43,6 +43,11 @@ from src.layer4_execution.paper import PaperExecutor
 from src.matching.event_map import EventMap, load_event_map
 from src.monitoring.http_server import HealthServer
 from src.monitoring.metrics import MetricsRegistry, persist_snapshot
+from src.monitoring.probes import (
+    PriceJumpTracker,
+    probe_clock_drift_seconds,
+    probe_usdc_price_usd,
+)
 from src.provenance import build_bundle
 from src.reports import CycleReport, render_cycle
 from src.risk import rules as risk_rules
@@ -53,6 +58,7 @@ from src.risk.policy import (
     RuleConfig,
     TriggerName,
 )
+from src.risk.reconcile import reconcile_paper_state
 from src.risk.recovery import perform_recovery
 from src.storage import state_db
 
@@ -201,6 +207,12 @@ async def run(config_path: str) -> None:
     intra_history = OpportunityHistory()
     cross_history = OpportunityHistory()
     news_windows = _build_news_windows(cfg)
+    price_tracker = PriceJumpTracker()
+    # Slow probes run every probe_cycles loops, not every cycle.
+    # At 5s/cycle * 24 cycles = 2 minutes between probes.
+    probe_cycles = 24
+    # Reconcile every reconcile_cycles loops. 60 * 5s = 5 min matches the doc.
+    reconcile_cycles = 60
 
     # Phase 2: monitoring + risk + alerts + health.
     metrics = MetricsRegistry()
@@ -357,6 +369,32 @@ async def run(config_path: str) -> None:
                 if cfg.allocation.total_capital_usd > 0
                 else 0.0
             )
+
+            # Fix #1: feed the 4 previously-dead kill switch gauges.
+            # Price jump tracker runs every cycle (cheap).
+            all_markets = poly_markets + kalshi_markets
+            if all_markets:
+                max_jump = price_tracker.observe(all_markets)
+                metrics.last_price_jump_pct.set(max_jump)
+
+            # NTP + USDC probe periodically (not every 5s).
+            if loop_num % probe_cycles == 1:
+                drift = await probe_clock_drift_seconds()
+                if drift is not None:
+                    metrics.clock_drift_seconds.set(drift)
+                usdc = await probe_usdc_price_usd()
+                if usdc is not None:
+                    metrics.usdc_price_usd.set(usdc)
+
+            # Reconcile every 5 min and feed mismatch count to metrics.
+            if loop_num % reconcile_cycles == 1:
+                try:
+                    rec = reconcile_paper_state(conn)
+                    metrics.position_mismatch_count.set(float(rec.mismatch_count))
+                    if rec.mismatch_count > 0:
+                        logger.warning("reconcile_mismatch", count=rec.mismatch_count)
+                except Exception as e:
+                    logger.warning("reconcile_failed", error=str(e))
 
             # Evaluate kill switches. Any tripped switch halts trading this cycle.
             if policy is not None:

@@ -13,14 +13,23 @@ from __future__ import annotations
 
 import hashlib
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Awaitable, Callable, List, Optional
 
 import structlog
 
 from src.layer3_strategy.models import Allocation, PaperPosition
+from src.layer4_execution.resolution import (
+    Resolution,
+    ResolutionOutcome,
+    realize_pnl,
+)
 from src.storage import state_db
 
 logger = structlog.get_logger(__name__)
+
+
+# Type alias: (platform, market_id) -> Resolution
+ResolutionFn = Callable[[str, str], Awaitable[Resolution]]
 
 
 def client_order_id(alloc: Allocation) -> str:
@@ -107,18 +116,31 @@ class PaperExecutor:
         return pos
 
     def resolve_due_positions(self, now: Optional[datetime] = None) -> List[PaperPosition]:
-        """Mark positions whose resolution_date has passed.
+        """Mark positions whose resolution_date has passed — synchronous fallback.
 
-        Realized PnL in paper mode equals the expected profit (we have no
-        information about the actual outcome without polling the exchange).
-        For Phase 0 this is fine — the purpose is to validate the pipeline. Phase
-        3 will replace this with real resolution queries.
+        DEPRECATED path: only used when no `ResolutionFn` is available
+        (e.g., purely in-process tests). It writes `expected_profit_usd` as
+        realized PnL, which is correct for delta-neutral intra_market but
+        WRONG for cross_market and resolution_convergence. Prefer
+        `resolve_due_positions_with_probes()` in production.
         """
         if now is None:
             now = datetime.now(timezone.utc)
         resolved_now: List[PaperPosition] = []
         for pos in state_db.due_for_resolution(self.conn, now.isoformat()):
-            realized = pos.expected_profit_usd  # paper optimism; acceptable in Phase 0
+            # Still conservative for intra_market (delta-neutral). For other
+            # strategies we keep the position UNRESOLVED until async probe
+            # paths run. Check the originating opportunity's strategy.
+            strategy = self._lookup_strategy(pos.opportunity_id)
+            if strategy != "intra_market":
+                logger.info(
+                    "paper_resolve_deferred",
+                    reason="non_intra_strategy_needs_probe",
+                    strategy=strategy,
+                    client_order_id=pos.client_order_id,
+                )
+                continue
+            realized = pos.expected_profit_usd
             state_db.mark_resolved(
                 self.conn, pos.client_order_id, realized, now.isoformat()
             )
@@ -127,5 +149,78 @@ class PaperExecutor:
                 "paper_position_resolved",
                 client_order_id=pos.client_order_id,
                 realized_pnl=str(realized),
+                path="sync_delta_neutral",
             )
         return resolved_now
+
+    def _lookup_strategy(self, opportunity_id: str) -> str:
+        row = self.conn.execute(
+            "SELECT strategy FROM opportunities WHERE opportunity_id = ?",
+            (opportunity_id,),
+        ).fetchone()
+        return str(row["strategy"]) if row else "intra_market"
+
+    async def resolve_due_positions_with_probes(
+        self,
+        *,
+        resolve_fn: ResolutionFn,
+        now: Optional[datetime] = None,
+    ) -> List[PaperPosition]:
+        """Async path: actually query exchange resolution endpoints.
+
+        For each position whose resolution_date has passed, call `resolve_fn`
+        with (platform, market_id). If the outcome is known → compute
+        realized PnL via strategy-aware `realize_pnl()`. If UNRESOLVED →
+        leave the position open; we'll try again next cycle.
+
+        Cross-market positions have composite market_ids of the form
+        "{poly_id}|{kalshi_ticker}"; we split and probe both sides.
+        """
+        if now is None:
+            now = datetime.now(timezone.utc)
+        resolved_now: List[PaperPosition] = []
+        for pos in state_db.due_for_resolution(self.conn, now.isoformat()):
+            strategy = self._lookup_strategy(pos.opportunity_id)
+            primary, secondary = await self._fetch_outcomes(
+                pos, strategy, resolve_fn
+            )
+            pnl = realize_pnl(pos, strategy, primary, secondary)
+            if pnl is None:
+                logger.info(
+                    "paper_probe_unresolved",
+                    client_order_id=pos.client_order_id,
+                    primary=primary.outcome.value,
+                    secondary=secondary.outcome.value if secondary else "n/a",
+                )
+                continue
+            state_db.mark_resolved(
+                self.conn, pos.client_order_id, pnl, now.isoformat()
+            )
+            resolved_now.append(pos)
+            logger.info(
+                "paper_position_resolved",
+                client_order_id=pos.client_order_id,
+                realized_pnl=str(pnl),
+                outcome_primary=primary.outcome.value,
+                outcome_secondary=secondary.outcome.value if secondary else "n/a",
+                path="async_probed",
+            )
+        return resolved_now
+
+    async def _fetch_outcomes(
+        self, pos: PaperPosition, strategy: str, resolve_fn: ResolutionFn
+    ):
+        """Query appropriate resolution endpoint(s) for a position."""
+        if strategy == "cross_market":
+            # Composite market_id = "{poly}|{kalshi}". Split, probe both.
+            parts = pos.market_id.split("|")
+            if len(parts) == 2:
+                a = await resolve_fn("polymarket", parts[0])
+                b = await resolve_fn("kalshi", parts[1])
+                return a, b
+            # Malformed — skip with unresolved.
+            return Resolution(ResolutionOutcome.UNRESOLVED, "malformed_composite_id"), None
+
+        # Single-platform: intra_market, resolution_convergence, etc.
+        primary = await resolve_fn(pos.platform, pos.market_id)
+        return primary, None

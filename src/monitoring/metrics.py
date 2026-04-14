@@ -95,11 +95,19 @@ class MetricsRegistry:
         self.api_errors_total: Dict[str, _Counter] = {}
         self.exceptions_total = _Counter()
 
-        # Gauges
+        # Gauges (kept as attrs so the kill switch rules can read them by name)
         self.capital_utilization_pct = _Gauge()
         self.clock_drift_seconds = _Gauge()
-        self.event_map_content_hash = _Gauge()  # treat as a checksum for change detection
+        self.event_map_content_hash = _Gauge()
         self.layer_heartbeat_age: Dict[str, _Gauge] = {}
+        # Gauges referenced by kill-switch rules. Must exist as attributes
+        # otherwise the rules will fall through to `getattr(..., None)` and
+        # silently never trip. Default 1.0 for usdc (no depeg claim when probe
+        # hasn't run); default 0 for the rest.
+        self.usdc_price_usd = _Gauge()
+        self.usdc_price_usd.set(1.0)
+        self.position_mismatch_count = _Gauge()
+        self.last_price_jump_pct = _Gauge()
 
         # Rolling windows for derived rates
         self.opportunities_per_minute = _RollingWindow(60)
@@ -141,6 +149,9 @@ class MetricsRegistry:
             ("exceptions_total", self.exceptions_total.value, None),
             ("capital_utilization_pct", self.capital_utilization_pct.value, None),
             ("clock_drift_seconds", self.clock_drift_seconds.value, None),
+            ("usdc_price_usd", self.usdc_price_usd.value, None),
+            ("position_mismatch_count", self.position_mismatch_count.value, None),
+            ("last_price_jump_pct", self.last_price_jump_pct.value, None),
             ("rolling_pnl_24h_usd", self.rolling_pnl_24h_usd.value, None),
             (
                 "exceptions_per_5min",

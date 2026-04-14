@@ -26,7 +26,12 @@ from src.backtest.fill_model import FillModelConfig, fill_price
 from src.backtest.metrics import BacktestMetrics, TradeRecord, compute_metrics
 from src.layer2_data_serving.replay_stream import ReplayStream
 from src.layer3_strategy.intra_market import StrategyContext, find_opportunities
-from src.layer3_strategy.models import Market, Opportunity
+from src.layer3_strategy.models import (
+    Market,
+    Opportunity,
+    OrderBookLevel,
+    OrderBookSide,
+)
 
 
 @dataclass
@@ -44,6 +49,50 @@ class BacktestResult:
     @property
     def metrics(self) -> BacktestMetrics:
         return compute_metrics(self.trades)
+
+
+def _consume_side(side: OrderBookSide, consumed: Decimal) -> OrderBookSide:
+    """Return a new OrderBookSide with `consumed` contracts removed from the top.
+
+    Walks levels from best onward, subtracting until `consumed` is exhausted.
+    If more than the book has is consumed, returns an empty side.
+    """
+    if consumed <= 0:
+        return side
+    remaining_to_consume = consumed
+    new_levels: list = []
+    for lv in side.levels:
+        if remaining_to_consume >= lv.size_contracts:
+            remaining_to_consume -= lv.size_contracts
+            continue
+        if remaining_to_consume > 0:
+            new_levels.append(
+                OrderBookLevel(
+                    price=lv.price,
+                    size_contracts=lv.size_contracts - remaining_to_consume,
+                )
+            )
+            remaining_to_consume = Decimal(0)
+        else:
+            new_levels.append(lv)
+    return OrderBookSide(levels=new_levels)
+
+
+def _market_minus_consumed(
+    market: Market, yes_consumed: Decimal, no_consumed: Decimal
+) -> Market:
+    """Return a copy of the market with `consumed` contracts removed from each side.
+
+    Used to honor the fact that two opportunities on the same market within
+    one tick can't both consume the full book — the first fill reduces
+    available depth for the second.
+    """
+    return market.model_copy(
+        update={
+            "yes_asks": _consume_side(market.yes_asks, yes_consumed),
+            "no_asks": _consume_side(market.no_asks, no_consumed),
+        }
+    )
 
 
 def _recompute_fill(
@@ -103,15 +152,30 @@ async def run_backtest(
         markets_by_id = {m.market_id: m for m in tick}
         opps = find_opportunities(tick, strategy_ctx)
         result.opportunities_detected += len(opps)
-        for opp in opps:
+
+        # Fix #4: track per-market consumed liquidity within this tick. Two
+        # opportunities on the same market both get bookable size from the
+        # SAME snapshot; the first "fill" reduces what's left for the second.
+        # Deterministic iteration order (the sort key) keeps replay stable.
+        opps_sorted = sorted(opps, key=lambda o: (-o.annualized_return, o.market_id))
+        consumed: dict = {}  # market_id -> (yes_consumed, no_consumed)
+
+        for opp in opps_sorted:
             market = markets_by_id.get(opp.market_id)
             if market is None:
                 continue
-            trade = _recompute_fill(market, opp, fill_cfg)
+            yes_c, no_c = consumed.get(opp.market_id, (Decimal(0), Decimal(0)))
+            adj_market = _market_minus_consumed(market, yes_c, no_c)
+            trade = _recompute_fill(adj_market, opp, fill_cfg)
             if trade is None:
                 continue
             result.opportunities_above_threshold += 1
             result.trades.append(trade)
+            # Charge this fill to the consumed budget.
+            consumed[opp.market_id] = (
+                yes_c + opp.size_contracts,
+                no_c + opp.size_contracts,
+            )
             # Canonical hash over (detected_at, market_id, size, realized_pnl).
             hasher.update(
                 (

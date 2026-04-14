@@ -83,6 +83,91 @@ class TestCalibration:
         assert in_confidence_interval(u, above) is False
 
 
+class TestBootstrapFromDb:
+    """Fix #5: priors must actually update from accumulated live data."""
+
+    def _open(self, tmp_path):
+        from src.storage import state_db
+
+        conn = state_db.connect(tmp_path / "state.db")
+        state_db.init_schema(conn)
+        return conn
+
+    def test_empty_db_returns_default_priors(self, tmp_path):
+        from src.layer3_strategy.uncertainty import bootstrap_inputs_from_db
+
+        conn = self._open(tmp_path)
+        inputs = bootstrap_inputs_from_db(conn)
+        # Should match default_pre_live exactly.
+        assert inputs.slippage_bps_samples == UncertaintyInputs.default_pre_live().slippage_bps_samples
+
+    def test_sufficient_data_replaces_priors(self, tmp_path):
+        from src.layer3_strategy.uncertainty import bootstrap_inputs_from_db
+        from src.storage import state_db
+
+        conn = self._open(tmp_path)
+        for i in range(25):
+            state_db.insert_execution_record(
+                conn,
+                opportunity_id=f"opp_{i}",
+                detected_at_iso="2026-04-14T12:00:00+00:00",
+                executed_at_iso="2026-04-14T12:00:05+00:00",
+                paper_expected=Decimal("5"),
+                paper_p05=Decimal("2"),
+                paper_p95=Decimal("7"),
+                paper_yes_px=Decimal("0.45"),
+                paper_no_px=Decimal("0.48"),
+                live_profit=Decimal("4"),
+                live_yes_px=Decimal("0.46"),
+                live_no_px=Decimal("0.49"),
+                live_latency_ms=300,
+                live_partial_fill=False,
+                live_slippage_bps=25,
+                within_ci=True,
+                divergence_bps=20,
+                gate="gate_1",
+                provenance_json="{}",
+            )
+
+        inputs = bootstrap_inputs_from_db(conn)
+        # All 25 slippage samples should be 25.
+        assert all(s == 25 for s in inputs.slippage_bps_samples)
+        # No partial fills → fill_rate_samples are all 1.0.
+        assert all(f == 1.0 for f in inputs.fill_rate_samples)
+
+    def test_insufficient_data_still_uses_priors(self, tmp_path):
+        from src.layer3_strategy.uncertainty import bootstrap_inputs_from_db
+        from src.storage import state_db
+
+        conn = self._open(tmp_path)
+        # Only 5 records — below the 20 threshold.
+        for i in range(5):
+            state_db.insert_execution_record(
+                conn,
+                opportunity_id=f"opp_{i}",
+                detected_at_iso="2026-04-14T12:00:00+00:00",
+                executed_at_iso="2026-04-14T12:00:05+00:00",
+                paper_expected=Decimal("5"),
+                paper_p05=Decimal("2"),
+                paper_p95=Decimal("7"),
+                paper_yes_px=Decimal("0.45"),
+                paper_no_px=Decimal("0.48"),
+                live_profit=Decimal("4"),
+                live_yes_px=Decimal("0.46"),
+                live_no_px=Decimal("0.49"),
+                live_latency_ms=300,
+                live_partial_fill=False,
+                live_slippage_bps=25,
+                within_ci=True,
+                divergence_bps=20,
+                gate="gate_1",
+                provenance_json="{}",
+            )
+        inputs = bootstrap_inputs_from_db(conn)
+        # Fallback to priors.
+        assert inputs.slippage_bps_samples == UncertaintyInputs.default_pre_live().slippage_bps_samples
+
+
 class TestUpdateInputs:
     def test_append_trims_to_retention(self):
         base = UncertaintyInputs(

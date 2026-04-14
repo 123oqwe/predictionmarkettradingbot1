@@ -26,14 +26,14 @@ def daily_loss_exceeded(metrics: MetricsRegistry, params: dict) -> RuleDecision:
 
 # 2. Abnormal price jump (a market with > X% move in one tick is suspicious).
 def abnormal_price_jump(metrics: MetricsRegistry, params: dict) -> RuleDecision:
-    """Watches a single gauge `last_price_jump_pct` set by the orchestrator
-    when an unusual jump is detected. Threshold is configurable.
+    """Read the `last_price_jump_pct` gauge set by the PriceJumpTracker.
 
-    The orchestrator updates this gauge to the largest tick-to-tick jump
-    observed in the most recent cycle. Default threshold 0.20 (20%).
+    The orchestrator calls `tracker.observe(markets)` each cycle and writes
+    the max jump into this gauge. A jump > threshold for one tick is a
+    strong sign of market disruption or data corruption.
     """
     threshold = float(params.get("max_price_jump_pct", 0.20))
-    jump = float(getattr(metrics, "last_price_jump_pct", None).value if hasattr(metrics, "last_price_jump_pct") else 0)  # noqa: E501
+    jump = float(metrics.last_price_jump_pct.value)
     if jump > threshold:
         return RuleDecision.trip(f"price_jump={jump:.3f} > {threshold}")
     return RuleDecision.ok()

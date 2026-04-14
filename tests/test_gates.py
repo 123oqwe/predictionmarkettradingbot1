@@ -68,6 +68,62 @@ class TestGate3Terminal:
         assert s.evaluate_for_graduation(_now() + timedelta(days=30)) is None
 
 
+class TestPersistence:
+    """Fix #3: gate state must survive a process restart."""
+
+    def _open(self, tmp_path):
+        from src.storage import state_db
+
+        conn = state_db.connect(tmp_path / "state.db")
+        state_db.init_schema(conn)
+        return conn
+
+    def test_load_or_init_creates_fresh_state(self, tmp_path):
+        conn = self._open(tmp_path)
+        s = GateState.load_or_init(conn)
+        assert s.current_gate == Gate.GATE_1
+        assert s.successful_fills_at_gate == 0
+
+    def test_record_fill_persists(self, tmp_path):
+        conn = self._open(tmp_path)
+        s = GateState.load_or_init(conn)
+        for _ in range(3):
+            s.record_fill()
+
+        # Close and reopen: counter should survive.
+        conn.close()
+        conn2 = self._open(tmp_path)
+        s2 = GateState.load_or_init(conn2)
+        assert s2.successful_fills_at_gate == 3
+        assert s2.current_gate == Gate.GATE_1
+
+    def test_advance_persists(self, tmp_path):
+        conn = self._open(tmp_path)
+        s = GateState.load_or_init(conn)
+        for _ in range(5):
+            s.record_fill()
+        later = s.gate_entered_at + timedelta(days=4)
+        target = s.evaluate_for_graduation(later)
+        s.advance_to(target, later)
+
+        conn.close()
+        conn2 = self._open(tmp_path)
+        s2 = GateState.load_or_init(conn2)
+        assert s2.current_gate == Gate.GATE_2
+        # Advancing reset the fill counter — persisted.
+        assert s2.successful_fills_at_gate == 0
+
+    def test_calibration_persists(self, tmp_path):
+        conn = self._open(tmp_path)
+        s = GateState.load_or_init(conn)
+        s.set_calibration_coverage(0.88)
+
+        conn.close()
+        conn2 = self._open(tmp_path)
+        s2 = GateState.load_or_init(conn2)
+        assert s2.calibration_coverage_recent == 0.88
+
+
 class TestThresholdsPerDoc:
     def test_gate1_is_60_pct_annualized(self):
         from decimal import Decimal
