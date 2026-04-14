@@ -20,7 +20,7 @@ from typing import List, Optional
 
 from src.layer3_strategy.models import Opportunity, PaperPosition
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 
 
 SCHEMA_SQL = """
@@ -89,6 +89,15 @@ CREATE TABLE IF NOT EXISTS gate_state (
     calibration_coverage_recent REAL,
     updated_at TEXT NOT NULL
 );
+
+-- Round A (#7): persist telegram alert timestamps so restart doesn't reset
+-- the hourly rate limiter. Stored as sent_at ISO strings.
+CREATE TABLE IF NOT EXISTS telegram_alert_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sent_at TEXT NOT NULL,
+    level TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_telegram_sent_at ON telegram_alert_log(sent_at);
 
 -- Phase 2: kill switch active state (one row per trigger). Persisted across restarts.
 CREATE TABLE IF NOT EXISTS kill_switch_state (
@@ -552,6 +561,28 @@ def execution_records_since(conn: sqlite3.Connection, since_iso: str) -> List[di
         (since_iso,),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------------- Round A fix #7: telegram alert log ----------------
+
+def record_telegram_alert(conn, sent_at_iso: str, level: str) -> None:
+    conn.execute(
+        "INSERT INTO telegram_alert_log(sent_at, level) VALUES(?, ?)",
+        (sent_at_iso, level),
+    )
+
+
+def count_non_critical_alerts_since(conn, since_iso: str) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) AS c FROM telegram_alert_log WHERE sent_at >= ? AND level != 'CRITICAL'",
+        (since_iso,),
+    ).fetchone()
+    return int(row["c"] or 0)
+
+
+def gc_telegram_alerts_older_than(conn, before_iso: str) -> int:
+    cur = conn.execute("DELETE FROM telegram_alert_log WHERE sent_at < ?", (before_iso,))
+    return cur.rowcount
 
 
 # ---------------- Phase 3 fix: gate state persistence ----------------

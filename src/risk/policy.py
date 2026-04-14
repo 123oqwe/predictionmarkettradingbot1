@@ -38,6 +38,7 @@ class TriggerName(str, enum.Enum):
     LAYER_STALL = "layer_stall"
     MANUAL = "manual"
     EVENT_MAP_DRIFT = "event_map_drift"
+    DISK_FREE_LOW = "disk_free_low"
 
 
 class PolicyMode(str, enum.Enum):

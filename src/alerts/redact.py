@@ -21,6 +21,14 @@ _REDACTORS: List[Tuple[str, Pattern]] = [
     ("[REDACTED:aws_access]", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
     # Generic Anthropic / OpenAI keys
     ("[REDACTED:api_key_sk]", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b")),
+    # Round A #16: JWTs (three base64url segments separated by dots)
+    ("[REDACTED:jwt]", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")),
+    # Round A #16: Bearer authorization headers
+    ("[REDACTED:bearer]", re.compile(r"(?i)Bearer\s+[A-Za-z0-9._~+/=-]{10,}")),
+    # Round A #16: UUIDs in token-like contexts
+    ("[REDACTED:uuid_token]", re.compile(
+        r"(?i)(?:token|key|secret|auth)[\s=:]+[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}"
+    )),
     # Polymarket / Kalshi-shape (very loose) — anything that looks like an env-var assignment
     # to a key/secret/token field gets the value redacted.
     (

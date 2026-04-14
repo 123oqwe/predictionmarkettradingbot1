@@ -137,3 +137,34 @@ class ExtractionCache:
 
     def size(self) -> int:
         return len(self._by_key)
+
+    def gc(self, *, keep_most_recent: int = 5000, before_date: Optional[datetime] = None) -> int:
+        """Round B #13: cache GC. Returns rows dropped.
+
+        Two modes:
+          - `keep_most_recent`: keep only the N newest entries per key.
+          - `before_date`: drop entries with cached_at older than this.
+
+        Rewrites the Parquet file once. Cheap enough to run daily.
+        """
+        if not self.path.exists():
+            return 0
+        table = pq.read_table(self.path)
+        rows = table.to_pylist()
+        rows.sort(key=lambda r: r.get("cached_at") or datetime.min.replace(tzinfo=timezone.utc))
+
+        if before_date is not None:
+            rows = [r for r in rows if (r.get("cached_at") or datetime.min.replace(tzinfo=timezone.utc)) >= before_date]
+        if len(rows) > keep_most_recent:
+            rows = rows[-keep_most_recent:]
+
+        dropped = table.num_rows - len(rows)
+        if dropped <= 0:
+            return 0
+
+        new_table = pa.Table.from_pylist(rows, schema=CACHE_SCHEMA)
+        pq.write_table(new_table, self.path, compression="snappy")
+        # Reload in-memory map.
+        self._by_key = {}
+        self._load()
+        return dropped

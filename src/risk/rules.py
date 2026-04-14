@@ -133,6 +133,16 @@ def event_map_drift(metrics: MetricsRegistry, params: dict) -> RuleDecision:
     return RuleDecision.ok()
 
 
+# 11 (Round A #17). Disk-free-low — prevent silent Parquet write failures.
+def disk_free_low(metrics: MetricsRegistry, params: dict) -> RuleDecision:
+    """params: {min_free_pct: float (default 5.0)}"""
+    threshold = float(params.get("min_free_pct", 5.0))
+    free = float(metrics.disk_free_pct.value)
+    if 0 < free < threshold:
+        return RuleDecision.trip(f"disk_free={free:.1f}% < {threshold}%")
+    return RuleDecision.ok()
+
+
 ALL_RULES = {
     "daily_loss_exceeded": daily_loss_exceeded,
     "abnormal_price_jump": abnormal_price_jump,
@@ -144,4 +154,5 @@ ALL_RULES = {
     "layer_stall": layer_stall,
     "manual": manual_kill,
     "event_map_drift": event_map_drift,
+    "disk_free_low": disk_free_low,
 }

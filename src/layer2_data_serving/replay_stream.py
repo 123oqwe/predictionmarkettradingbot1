@@ -60,38 +60,40 @@ class ReplayStream:
         return out
 
     async def ticks(self) -> AsyncIterator[List[Market]]:
-        """Yield groups of Market snapshots sharing the same `fetched_at`."""
-        rows: List[dict] = []
+        """Yield groups of Market snapshots sharing the same `fetched_at`.
+
+        Round B #14: streams file-by-file. We rely on the invariant that each
+        Parquet file is a single UTC day, so rows in file N+1 all have
+        timestamps strictly greater than file N. Within one file we sort (cheap)
+        and yield groups. Memory footprint = one file's row list, not the
+        whole date range.
+        """
         for f in self._files_in_range():
-            table = pq.read_table(f)
-            # Convert to Python rows in chunks to avoid loading everything at once
-            # for very large files.
-            df = table.to_pandas(ignore_metadata=True) if False else None  # noqa
+            try:
+                table = pq.read_table(f)
+            except Exception:
+                continue
+            rows: List[dict] = []
             for batch in table.to_batches(max_chunksize=10_000):
-                batch_rows = batch.to_pylist()
-                for r in batch_rows:
+                for r in batch.to_pylist():
                     if r["fetched_at"] is None:
                         continue
                     ts = r["fetched_at"]
-                    # Pyarrow returns tz-aware datetimes for timestamp[us, UTC].
                     if isinstance(ts, datetime) and self.start <= ts <= self.end:
                         rows.append(r)
+            rows.sort(key=lambda r: (r["fetched_at"], r["market_id"]))
 
-        # Sort by fetched_at then market_id for determinism.
-        rows.sort(key=lambda r: (r["fetched_at"], r["market_id"]))
-
-        # Group by fetched_at (same-tick batches).
-        current_ts: Optional[datetime] = None
-        group: List[Market] = []
-        for r in rows:
-            ts = r["fetched_at"]
-            if current_ts is None:
-                current_ts = ts
-            if ts != current_ts:
-                if group:
-                    yield group
-                group = []
-                current_ts = ts
-            group.append(row_to_market(r))
-        if group:
-            yield group
+            current_ts: Optional[datetime] = None
+            group: List[Market] = []
+            for r in rows:
+                ts = r["fetched_at"]
+                if current_ts is None:
+                    current_ts = ts
+                if ts != current_ts:
+                    if group:
+                        yield group
+                    group = []
+                    current_ts = ts
+                group.append(row_to_market(r))
+            if group:
+                yield group

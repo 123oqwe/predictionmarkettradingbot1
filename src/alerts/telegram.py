@@ -49,13 +49,33 @@ class TelegramConfig:
 
 
 class TelegramAlerter:
-    def __init__(self, cfg: TelegramConfig):
+    """Telegram alerter with DB-backed rate limiting.
+
+    Round A fix #7: rate-limit counter persists in `telegram_alert_log`.
+    Process restarts don't reset the window — an alert loop in a crash-restart
+    scenario won't flood operators with duplicate warnings.
+
+    Pass `conn=None` to use the old in-memory deque (tests, ephemeral runs).
+    """
+
+    def __init__(self, cfg: TelegramConfig, conn=None):
         self.cfg = cfg
+        self.conn = conn
         self._recent_non_critical: Deque[float] = deque()
         self._timeout = aiohttp.ClientTimeout(total=cfg.api_timeout_seconds)
 
     def _allow_non_critical(self, now: float) -> bool:
-        # Drop entries older than 1h.
+        """DB-backed if self.conn is set, else in-memory fallback."""
+        if self.conn is not None:
+            from datetime import datetime, timedelta, timezone
+
+            from src.storage import state_db
+
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+            sent = state_db.count_non_critical_alerts_since(self.conn, cutoff.isoformat())
+            return sent < self.cfg.max_per_hour_non_critical
+
+        # In-memory fallback.
         cutoff = now - 3600
         while self._recent_non_critical and self._recent_non_critical[0] < cutoff:
             self._recent_non_critical.popleft()
@@ -63,6 +83,22 @@ class TelegramAlerter:
             return False
         self._recent_non_critical.append(now)
         return True
+
+    def _record_sent(self, level: "AlertLevel") -> None:
+        if self.conn is None:
+            return
+        from datetime import datetime, timezone
+
+        from src.storage import state_db
+
+        try:
+            state_db.record_telegram_alert(
+                self.conn,
+                datetime.now(timezone.utc).isoformat(),
+                level.value,
+            )
+        except Exception as e:
+            logger.warning("telegram_log_failed", error=str(e))
 
     async def send(self, level: AlertLevel, message: str, *, force: bool = False) -> bool:
         """Returns True if the message was actually sent (or stub-logged)."""
@@ -76,6 +112,8 @@ class TelegramAlerter:
             if not self._allow_non_critical(now):
                 logger.info("telegram_alert_rate_limited", level=level.value, body=body[:100])
                 return False
+
+        self._record_sent(level)
 
         if not self.cfg.enabled:
             # Stub mode: log and return.

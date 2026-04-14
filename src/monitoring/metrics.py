@@ -108,6 +108,9 @@ class MetricsRegistry:
         self.usdc_price_usd.set(1.0)
         self.position_mismatch_count = _Gauge()
         self.last_price_jump_pct = _Gauge()
+        # Round A #17: disk free %. Default 100 (no trip claim) until probed.
+        self.disk_free_pct = _Gauge()
+        self.disk_free_pct.set(100.0)
 
         # Rolling windows for derived rates
         self.opportunities_per_minute = _RollingWindow(60)
@@ -152,6 +155,7 @@ class MetricsRegistry:
             ("usdc_price_usd", self.usdc_price_usd.value, None),
             ("position_mismatch_count", self.position_mismatch_count.value, None),
             ("last_price_jump_pct", self.last_price_jump_pct.value, None),
+            ("disk_free_pct", self.disk_free_pct.value, None),
             ("rolling_pnl_24h_usd", self.rolling_pnl_24h_usd.value, None),
             (
                 "exceptions_per_5min",

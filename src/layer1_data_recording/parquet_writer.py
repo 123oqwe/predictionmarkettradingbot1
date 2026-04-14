@@ -125,7 +125,13 @@ class DailyParquetWriter:
         platform: str,
         flush_interval_seconds: int = 30,
         flush_batch_rows: int = 200,
+        max_buffer_size: int = 10_000,
     ):
+        # Round B #12: back-pressure — the buffer has a hard ceiling. If
+        # flushes start failing (disk full, permission error), we refuse new
+        # writes rather than growing memory unboundedly.
+        self.max_buffer_size = max_buffer_size
+        self._drops_due_to_backpressure = 0
         self.base_dir = Path(base_dir)
         self.platform = platform
         self.flush_interval_seconds = flush_interval_seconds
@@ -170,7 +176,12 @@ class DailyParquetWriter:
         async with self._lock:
             now = datetime.now(timezone.utc)
             self._rollover_if_needed(now)
+            # Back-pressure: if we're already at the ceiling, drop new rows
+            # and count the drops (surfaced via drops_due_to_backpressure).
             for m in markets:
+                if len(self._buffer) >= self.max_buffer_size:
+                    self._drops_due_to_backpressure += 1
+                    continue
                 self._buffer.append(market_to_row(m))
             should_flush = (
                 len(self._buffer) >= self.flush_batch_rows
@@ -178,6 +189,10 @@ class DailyParquetWriter:
             )
             if should_flush:
                 await self._flush_locked(now)
+
+    @property
+    def drops_due_to_backpressure(self) -> int:
+        return self._drops_due_to_backpressure
 
     async def _flush_locked(self, now: datetime) -> None:
         if not self._buffer or self._writer is None:

@@ -46,6 +46,7 @@ from src.monitoring.metrics import MetricsRegistry, persist_snapshot
 from src.monitoring.probes import (
     PriceJumpTracker,
     probe_clock_drift_seconds,
+    probe_disk_free_pct,
     probe_usdc_price_usd,
 )
 from src.provenance import build_bundle
@@ -223,7 +224,8 @@ async def run(config_path: str) -> None:
             bot_token=os.environ.get(cfg.telegram.bot_token_env) if cfg.telegram else None,
             chat_id=os.environ.get(cfg.telegram.chat_id_env) if cfg.telegram else None,
             max_per_hour_non_critical=(cfg.telegram.max_per_hour_non_critical if cfg.telegram else 5),
-        )
+        ),
+        conn=conn,  # #7: persist rate-limit counter to SQLite
     )
 
     # Startup safety: perform_recovery reads kill-switch state; if tripped and
@@ -377,7 +379,7 @@ async def run(config_path: str) -> None:
                 max_jump = price_tracker.observe(all_markets)
                 metrics.last_price_jump_pct.set(max_jump)
 
-            # NTP + USDC probe periodically (not every 5s).
+            # NTP + USDC + disk probe periodically (not every 5s).
             if loop_num % probe_cycles == 1:
                 drift = await probe_clock_drift_seconds()
                 if drift is not None:
@@ -385,6 +387,9 @@ async def run(config_path: str) -> None:
                 usdc = await probe_usdc_price_usd()
                 if usdc is not None:
                     metrics.usdc_price_usd.set(usdc)
+                free = probe_disk_free_pct(cfg.storage.snapshots_dir)
+                if free is not None:
+                    metrics.disk_free_pct.set(free)
 
             # Reconcile every 5 min and feed mismatch count to metrics.
             if loop_num % reconcile_cycles == 1:

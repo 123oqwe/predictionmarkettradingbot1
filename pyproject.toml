@@ -23,6 +23,17 @@ dev = [
   "pytest-cov>=4.1",
   "ruff>=0.1",
 ]
+# Phase 4 LLM extractor. STUB mode works without this; install to enable
+# Anthropic mode: `pip install -e ".[llm]"`.
+llm = [
+  "anthropic>=0.30",
+]
+# Phase 3+ Postgres backend. SQLite remains the default; install to switch:
+# `pip install -e ".[postgres]"`.
+postgres = [
+  "asyncpg>=0.29",
+  "psycopg[binary]>=3.1",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -39,4 +50,4 @@ target-version = "py39"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "B", "C4", "SIM"]
-ignore = ["E501", "B008", "SIM105", "SIM117", "F841"]
+ignore = ["E501", "B008", "SIM105", "SIM108", "SIM117", "F841"]

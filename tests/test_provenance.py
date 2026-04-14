@@ -25,7 +25,7 @@ def test_build_bundle_fields_present():
     b = build_bundle({"mode": "paper"})
     assert isinstance(b, ProvenanceBundle)
     assert b.git_commit  # either a hash or 'unknown'
-    assert b.schema_version == 1
+    assert b.schema_version >= 1  # v2 added deps_hash + python_version fields
     # Serialize must be JSON-parseable and not contain raw_config.
     import json
 

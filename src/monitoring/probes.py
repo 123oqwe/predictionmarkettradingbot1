@@ -149,3 +149,25 @@ class PriceJumpTracker:
 def position_mismatch_count_from_reconcile(reconcile_report) -> int:
     """Count the mismatch findings from a ReconcileReport."""
     return int(reconcile_report.mismatch_count)
+
+
+# ---------------- Round A #17: Disk free space ----------------
+
+
+def probe_disk_free_pct(path: str = ".") -> Optional[float]:
+    """Return the percent of free space on the filesystem containing `path`.
+
+    None if an IO error prevents the read (shouldn't happen, but safe).
+    A low value feeds `disk_free_pct` gauge; kill switch trips < configured
+    threshold (default 5%).
+    """
+    import shutil
+
+    try:
+        total, used, free = shutil.disk_usage(path)
+        if total == 0:
+            return None
+        return (free / total) * 100.0
+    except OSError as e:
+        logger.warning("disk_probe_failed", error=str(e), path=path)
+        return None
