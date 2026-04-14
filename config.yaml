@@ -28,6 +28,37 @@ strategy:
     max_trade_size_contracts: "1000"
     min_market_liquidity_usd: "100"     # Skip dead markets
     stale_snapshot_threshold_seconds: 10
+  cross_market:
+    # Per phase-1 EV math: r_cross >= (r_intra + p_div) / (1 - p_div).
+    # With r_intra=0.20 and p_div=0.05 → 26.32%. Round up to 28% as the doc suggests.
+    min_annualized_return: "0.28"
+    assumed_rule_divergence_prob: "0.05"
+
+kalshi:
+  base_url: "https://api.elections.kalshi.com/trade-api/v2"
+  poll_interval_seconds: 5
+  request_timeout_seconds: 10
+  max_concurrent_requests: 8
+  fee_bps: 0
+  markets_limit: 100
+  # Read endpoints are public; key only needed for trading. Set via env if you have one.
+  api_key_env: "KALSHI_API_KEY"
+
+event_map_path: "event_map.yaml"
+
+adverse_selection:
+  age_threshold_seconds: 60
+  min_market_age_hours: 24
+  news_windows:
+    - topic_tags: [fed, interest_rates]
+      blackout_minutes_before: 15
+      blackout_minutes_after: 60
+    - topic_tags: [crypto]
+      blackout_minutes_before: 5
+      blackout_minutes_after: 30
+    - topic_tags: [cpi, inflation]
+      blackout_minutes_before: 15
+      blackout_minutes_after: 60
 
 allocation:
   total_capital_usd: "1000"

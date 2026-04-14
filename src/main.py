@@ -1,39 +1,48 @@
-"""Phase 0 orchestrator. Wires Layers 1 → 2 → 3 → 4 and runs a CLI dashboard.
+"""Phase 0 + Phase 1 orchestrator.
+
+Wires Layers 1-4 plus Phase 1 additions: Kalshi fetcher, cross-market detection,
+adverse selection filters, daily report v2.
+
+Architectural test of Phase 1: this file gained Kalshi support and cross-market
+detection without Layers 2, 3, 4 changing. Layer 3 still pure. Layer 2 unchanged.
 
 Run:
     python -m src.main --config config.yaml
-
-The orchestrator is intentionally small. Everything non-trivial lives in the
-layer modules. The main loop is:
-
-    1. Fetch a snapshot (Layer 1 → Parquet + in-memory)
-    2. Run detection on it (Layer 3)
-    3. Allocate capital (Layer 3)
-    4. Fill allocations (Layer 4 → SQLite)
-    5. Resolve any due positions
-    6. Print dashboard
-    7. Sleep to next cycle
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import signal
 import sys
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List
 
 import structlog
 
-from src.config import load_config
+from src.config import Config, load_config
+from src.layer1_data_recording.kalshi_fetcher import KalshiFetcher
 from src.layer1_data_recording.parquet_writer import DailyParquetWriter
 from src.layer1_data_recording.polymarket_fetcher import PolymarketFetcher
+from src.layer3_strategy.adverse_selection import (
+    NewsWindow,
+    OpportunityHistory,
+    apply_filters,
+)
 from src.layer3_strategy.allocation import allocate_capital
+from src.layer3_strategy.cross_market import (
+    CrossMarketContext,
+    find_cross_opportunities,
+)
 from src.layer3_strategy.intra_market import StrategyContext, find_opportunities
-from src.layer3_strategy.models import Market
+from src.layer3_strategy.models import Market, Opportunity
 from src.layer4_execution.paper import PaperExecutor
+from src.matching.event_map import EventMap, load_event_map
 from src.provenance import build_bundle
+from src.reports import CycleReport, render_cycle
 from src.storage import state_db
 
 logger = structlog.get_logger(__name__)
@@ -49,12 +58,35 @@ def _setup_logging() -> None:
     )
 
 
+def _build_news_windows(cfg: Config) -> List[NewsWindow]:
+    if cfg.adverse_selection is None:
+        return []
+    return [
+        NewsWindow(
+            topic_tags=tuple(w.topic_tags),
+            blackout_minutes_before=w.blackout_minutes_before,
+            blackout_minutes_after=w.blackout_minutes_after,
+        )
+        for w in cfg.adverse_selection.news_windows
+    ]
+
+
+def _topic_tags_for(opp: Opportunity, event_map: EventMap) -> List[str]:
+    """Resolve topic tags for an opportunity from the event map (cross only)."""
+    if opp.strategy != "cross_market":
+        return []
+    p = event_map.by_id(opp.event_id)
+    return list(p.topic_tags) if p else []
+
+
 async def run(config_path: str) -> None:
     _setup_logging()
     cfg = load_config(config_path)
-
     provenance = build_bundle(cfg.raw)
     provenance_json = provenance.serialize()
+
+    event_map_path = cfg.event_map_path or "event_map.yaml"
+    event_map = load_event_map(event_map_path)
 
     logger.info(
         "startup",
@@ -62,36 +94,67 @@ async def run(config_path: str) -> None:
         git=provenance.git_commit,
         config_hash=provenance.config_hash,
         dirty=provenance.git_dirty,
+        event_map_hash=event_map.content_hash,
+        event_map_pairs=len(event_map.pairs),
+        event_map_enabled=len(event_map.enabled()),
+        kalshi_enabled=cfg.kalshi is not None,
     )
 
-    # Storage.
     conn = state_db.connect(cfg.storage.state_db_path)
     state_db.init_schema(conn)
 
-    # Layer 1.
-    fetcher = PolymarketFetcher(
+    poly_fetcher = PolymarketFetcher(
         gamma_base_url=cfg.polymarket.gamma_base_url,
         clob_base_url=cfg.polymarket.clob_base_url,
         fee_bps=cfg.polymarket.fee_bps,
         timeout_seconds=cfg.polymarket.request_timeout_seconds,
         max_concurrency=cfg.polymarket.max_concurrent_requests,
     )
-    writer = DailyParquetWriter(
+    poly_writer = DailyParquetWriter(
         base_dir=cfg.storage.snapshots_dir,
         platform="polymarket",
         flush_interval_seconds=cfg.storage.parquet_flush_interval_seconds,
     )
 
-    # Layer 3 ctx.
-    ctx = StrategyContext(
+    kalshi_fetcher = None
+    kalshi_writer = None
+    if cfg.kalshi is not None:
+        kalshi_fetcher = KalshiFetcher(
+            base_url=cfg.kalshi.base_url,
+            fee_bps=cfg.kalshi.fee_bps,
+            api_key=os.environ.get(cfg.kalshi.api_key_env),
+            timeout_seconds=cfg.kalshi.request_timeout_seconds,
+            max_concurrency=cfg.kalshi.max_concurrent_requests,
+            markets_limit=cfg.kalshi.markets_limit,
+        )
+        kalshi_writer = DailyParquetWriter(
+            base_dir=cfg.storage.snapshots_dir,
+            platform="kalshi",
+            flush_interval_seconds=cfg.storage.parquet_flush_interval_seconds,
+        )
+
+    intra_ctx = StrategyContext(
         config=cfg.intra_market,
         gas_cost_usd=cfg.polymarket.gas_estimate_usd,
         config_hash=provenance.config_hash,
         git_hash=provenance.git_commit,
     )
+    cross_ctx = None
+    if cfg.cross_market is not None:
+        cross_ctx = CrossMarketContext(
+            intra=intra_ctx,
+            cross_min_annualized_return=cfg.cross_market.min_annualized_return,
+            polymarket_gas_usd=cfg.polymarket.gas_estimate_usd,
+            kalshi_gas_usd=Decimal(0),
+            config_hash=provenance.config_hash,
+            git_hash=provenance.git_commit,
+        )
 
-    # Layer 4.
     executor = PaperExecutor(conn=conn, provenance_json=provenance_json)
+
+    intra_history = OpportunityHistory()
+    cross_history = OpportunityHistory()
+    news_windows = _build_news_windows(cfg)
 
     stop = asyncio.Event()
 
@@ -104,7 +167,6 @@ async def run(config_path: str) -> None:
         loop.add_signal_handler(signal.SIGINT, _signal_handler)
         loop.add_signal_handler(signal.SIGTERM, _signal_handler)
     except NotImplementedError:
-        # Windows / non-unix — signal handlers not available. Skip gracefully.
         pass
 
     loop_num = 0
@@ -112,74 +174,120 @@ async def run(config_path: str) -> None:
         while not stop.is_set():
             loop_num += 1
             cycle_start = datetime.now(timezone.utc)
+            cycle = CycleReport()
 
-            # 1. Fetch.
-            try:
-                markets = await fetcher.fetch_snapshot()
-            except Exception as e:
-                logger.error("fetch_failed", error=str(e))
-                state_db.log_error(
-                    conn,
-                    category="fetch",
-                    message=str(e),
-                    context=None,
-                    provenance_json=provenance_json,
-                    occurred_at_iso=datetime.now(timezone.utc).isoformat(),
-                )
-                markets = []
+            fetch_tasks = [poly_fetcher.fetch_snapshot()]
+            if kalshi_fetcher is not None:
+                fetch_tasks.append(kalshi_fetcher.fetch_snapshot())
+            results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
 
-            # 2. Persist snapshot.
-            if markets:
+            poly_markets: List[Market] = (
+                results[0] if (results and not isinstance(results[0], Exception)) else []
+            )
+            kalshi_markets: List[Market] = (
+                results[1] if (
+                    kalshi_fetcher is not None
+                    and len(results) > 1
+                    and not isinstance(results[1], Exception)
+                ) else []
+            )
+            cycle.markets_polymarket = len(poly_markets)
+            cycle.markets_kalshi = len(kalshi_markets)
+
+            if poly_markets:
                 try:
-                    await writer.write_many(markets)
+                    await poly_writer.write_many(poly_markets)
                 except Exception as e:
-                    logger.error("parquet_write_failed", error=str(e))
+                    logger.error("polymarket_parquet_write_failed", error=str(e))
+            if kalshi_markets and kalshi_writer is not None:
+                try:
+                    await kalshi_writer.write_many(kalshi_markets)
+                except Exception as e:
+                    logger.error("kalshi_parquet_write_failed", error=str(e))
 
-            # 3. Detect.
-            opportunities = find_opportunities(markets, ctx) if markets else []
+            intra_opps = find_opportunities(poly_markets, intra_ctx) if poly_markets else []
+            cycle.intra_detected = intra_opps
 
-            # 4. Allocate.
+            cross_opps: List[Opportunity] = []
+            if cross_ctx and event_map.enabled():
+                poly_by_id = {m.market_id: m for m in poly_markets}
+                kalshi_by_ticker = {m.market_id: m for m in kalshi_markets}
+                cross_opps = find_cross_opportunities(
+                    event_map.enabled(),
+                    poly_by_id,
+                    kalshi_by_ticker,
+                    cross_ctx,
+                    cfg.intra_market,
+                    cfg.cross_market.min_annualized_return,
+                )
+            cycle.cross_detected = cross_opps
+
+            now = datetime.now(timezone.utc)
+            if cfg.adverse_selection:
+                cycle.intra_passed, cycle.intra_filter_stats = apply_filters(
+                    intra_opps,
+                    history=intra_history,
+                    age_threshold_seconds=cfg.adverse_selection.age_threshold_seconds,
+                    topic_tags_for=lambda o: [],
+                    news_windows=news_windows,
+                    upcoming_news=[],
+                    market_listed_at_for=lambda o: None,
+                    min_market_age_hours=cfg.adverse_selection.min_market_age_hours,
+                    now=now,
+                )
+                cycle.cross_passed, cycle.cross_filter_stats = apply_filters(
+                    cross_opps,
+                    history=cross_history,
+                    age_threshold_seconds=cfg.adverse_selection.age_threshold_seconds,
+                    topic_tags_for=lambda o: _topic_tags_for(o, event_map),
+                    news_windows=news_windows,
+                    upcoming_news=[],
+                    market_listed_at_for=lambda o: None,
+                    min_market_age_hours=cfg.adverse_selection.min_market_age_hours,
+                    now=now,
+                )
+            else:
+                cycle.intra_passed = intra_opps
+                cycle.cross_passed = cross_opps
+
+            # Allocate intra only. Cross-market live trading is gated to Phase 3.
             reserved = state_db.total_capital_locked(conn)
-            markets_by_id: Dict[str, Market] = {m.market_id: m for m in markets}
+            markets_by_id: Dict[str, Market] = {m.market_id: m for m in poly_markets}
             allocations = allocate_capital(
-                opportunities,
+                cycle.intra_passed,
                 markets_by_id,
-                ctx,
+                intra_ctx,
                 cfg.allocation,
                 reserved_capital_usd=reserved,
             )
+            cycle.allocations_count = len(allocations)
 
-            # 5. Fill paper trades.
             for alloc in allocations:
                 market = markets_by_id.get(alloc.opportunity.market_id)
                 if market is None:
                     continue
                 try:
                     executor.fill_with_resolution(alloc, market.resolution_date)
+                    cycle.capital_allocated_this_cycle += alloc.allocated_capital_usd
                 except Exception as e:
-                    logger.error(
-                        "paper_fill_failed",
-                        opportunity_id=alloc.opportunity.opportunity_id,
-                        error=str(e),
-                    )
+                    logger.error("paper_fill_failed", error=str(e))
 
-            # 6. Resolve any due positions.
             executor.resolve_due_positions()
 
-            # 7. Dashboard.
-            _print_dashboard(
-                loop_num=loop_num,
-                markets=markets,
-                opportunities=opportunities,
-                allocations=allocations,
-                conn=conn,
-                provenance=provenance,
+            for opp in cycle.cross_passed:
+                state_db.write_opportunity(conn, opp, provenance_json)
+
+            now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+            header = (
+                f"[{now_str}] Loop #{loop_num:,}  git={provenance.git_commit}  "
+                f"config={provenance.config_hash}  event_map={event_map.content_hash}"
             )
+            print(render_cycle(cycle, header=header), flush=True)
 
-            # 8. Flush Parquet periodically.
-            await writer.flush()
+            await poly_writer.flush()
+            if kalshi_writer is not None:
+                await kalshi_writer.flush()
 
-            # 9. Sleep until next cycle.
             elapsed = (datetime.now(timezone.utc) - cycle_start).total_seconds()
             remaining = max(0.0, cfg.polymarket.poll_interval_seconds - elapsed)
             try:
@@ -187,43 +295,15 @@ async def run(config_path: str) -> None:
             except asyncio.TimeoutError:
                 pass
     finally:
-        await writer.close()
+        await poly_writer.close()
+        if kalshi_writer is not None:
+            await kalshi_writer.close()
         conn.close()
 
 
-def _print_dashboard(
-    *,
-    loop_num: int,
-    markets,
-    opportunities,
-    allocations,
-    conn,
-    provenance,
-) -> None:
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    realized = state_db.realized_pnl_total(conn)
-    locked = state_db.total_capital_locked(conn)
-    lines = [
-        f"[{now}] Loop #{loop_num:,}",
-        f"Markets scanned: {len(markets)}",
-        f"Opportunities detected: {len(opportunities)}",
-        f"Allocations this cycle: {len(allocations)}",
-        f"Capital locked: ${locked:.2f}  |  Realized PnL: ${realized:.2f}",
-        f"Git: {provenance.git_commit}  |  Config: {provenance.config_hash}",
-    ]
-    if opportunities:
-        top = sorted(opportunities, key=lambda o: -o.annualized_return)[:3]
-        for i, o in enumerate(top, 1):
-            lines.append(
-                f"  #{i} {o.title[:50]:<50} size={o.size_contracts} "
-                f"ann={o.annualized_return:.2%} days={o.days_to_resolution:.1f}"
-            )
-    print("\n".join(lines), flush=True)
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Phase 0 orchestrator")
-    parser.add_argument("--config", default="config.yaml", help="path to config.yaml")
+    parser = argparse.ArgumentParser(description="Phase 0 + Phase 1 orchestrator")
+    parser.add_argument("--config", default="config.yaml")
     args = parser.parse_args()
 
     if not Path(args.config).exists():

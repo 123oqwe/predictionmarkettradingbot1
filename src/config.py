@@ -1,10 +1,10 @@
 """Config loader. Every numeric field becomes Decimal; float never enters the system."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import yaml
 
@@ -62,6 +62,37 @@ class PaperExecutionConfig:
 
 
 @dataclass(frozen=True)
+class CrossMarketConfig:
+    min_annualized_return: Decimal
+    assumed_rule_divergence_prob: Decimal
+
+
+@dataclass(frozen=True)
+class KalshiConfig:
+    base_url: str
+    poll_interval_seconds: int
+    request_timeout_seconds: int
+    max_concurrent_requests: int
+    fee_bps: int
+    markets_limit: int
+    api_key_env: str
+
+
+@dataclass(frozen=True)
+class NewsWindowConfig:
+    topic_tags: tuple
+    blackout_minutes_before: int
+    blackout_minutes_after: int
+
+
+@dataclass(frozen=True)
+class AdverseSelectionConfig:
+    age_threshold_seconds: int
+    min_market_age_hours: int
+    news_windows: tuple
+
+
+@dataclass(frozen=True)
 class Config:
     mode: str
     polymarket: PolymarketConfig
@@ -69,7 +100,12 @@ class Config:
     intra_market: IntraMarketConfig
     allocation: AllocationConfig
     paper_execution: PaperExecutionConfig
-    raw: Dict[str, Any]  # kept for hashing / provenance
+    # Phase 1 additions; optional so Phase 0 configs still load.
+    cross_market: Optional[CrossMarketConfig] = None
+    kalshi: Optional[KalshiConfig] = None
+    adverse_selection: Optional[AdverseSelectionConfig] = None
+    event_map_path: Optional[str] = None
+    raw: Dict[str, Any] = field(default_factory=dict)  # for hashing / provenance
 
 
 def load_config(path: str | Path) -> Config:
@@ -81,6 +117,44 @@ def load_config(path: str | Path) -> Config:
     im = raw["strategy"]["intra_market"]
     al = raw["allocation"]
     pe = raw["execution"]["paper"]
+
+    cross = None
+    if "cross_market" in raw.get("strategy", {}):
+        cm = raw["strategy"]["cross_market"]
+        cross = CrossMarketConfig(
+            min_annualized_return=_d(cm["min_annualized_return"]),
+            assumed_rule_divergence_prob=_d(cm["assumed_rule_divergence_prob"]),
+        )
+
+    kalshi_cfg = None
+    if "kalshi" in raw:
+        k = raw["kalshi"]
+        kalshi_cfg = KalshiConfig(
+            base_url=k["base_url"],
+            poll_interval_seconds=int(k["poll_interval_seconds"]),
+            request_timeout_seconds=int(k["request_timeout_seconds"]),
+            max_concurrent_requests=int(k["max_concurrent_requests"]),
+            fee_bps=int(k["fee_bps"]),
+            markets_limit=int(k.get("markets_limit", 100)),
+            api_key_env=k.get("api_key_env", "KALSHI_API_KEY"),
+        )
+
+    adv = None
+    if "adverse_selection" in raw:
+        a = raw["adverse_selection"]
+        windows = tuple(
+            NewsWindowConfig(
+                topic_tags=tuple(w["topic_tags"]),
+                blackout_minutes_before=int(w["blackout_minutes_before"]),
+                blackout_minutes_after=int(w["blackout_minutes_after"]),
+            )
+            for w in (a.get("news_windows") or [])
+        )
+        adv = AdverseSelectionConfig(
+            age_threshold_seconds=int(a["age_threshold_seconds"]),
+            min_market_age_hours=int(a["min_market_age_hours"]),
+            news_windows=windows,
+        )
 
     return Config(
         mode=raw["mode"],
@@ -114,5 +188,9 @@ def load_config(path: str | Path) -> Config:
         paper_execution=PaperExecutionConfig(
             resolution_poll_interval_seconds=int(pe["resolution_poll_interval_seconds"]),
         ),
+        cross_market=cross,
+        kalshi=kalshi_cfg,
+        adverse_selection=adv,
+        event_map_path=raw.get("event_map_path"),
         raw=raw,
     )

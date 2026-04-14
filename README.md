@@ -2,12 +2,13 @@
 
 Your owned prediction market trading bot.
 
-Phase 0 MVP: four-layer architecture, intra-market arbitrage detection on Polymarket, paper execution only.
+**Phase 0 + Phase 1**: four-layer architecture, intra-market detection on Polymarket, cross-market detection across Polymarket + Kalshi, adverse-selection filters, paper execution.
 
 See [`docs/README.md`](docs/README.md) for the full 7-phase roadmap.
 
-## What this ships (Phase 0)
+## What this ships (Phase 0 + Phase 1)
 
+**Phase 0 — foundations:**
 - Four-layer architecture: data recording, data serving, strategy, execution
 - Polymarket CLOB fetcher (read-only, no auth)
 - Append-only Parquet log with daily UTC rotation
@@ -18,7 +19,16 @@ See [`docs/README.md`](docs/README.md) for the full 7-phase roadmap.
 - SQLite state DB (WAL + synchronous=FULL) with idempotent inserts
 - Paper execution with deterministic client_order_id
 - Provenance (git hash + config hash) attached to every record
-- 48 unit tests, all passing, including replay determinism
+
+**Phase 1 — dual platform + matching:**
+- Kalshi fetcher with cent-tick price quantization (a 0.505 detection becomes 0.51 actual)
+- Strict `event_map.yaml` loader: enforces ≥5 edge cases per pair, ≥1 marked divergent, content hash for provenance
+- Cross-market detection (both directions per pair, same purity guarantees as intra)
+- Cross-market threshold derivation: `r_cross >= (r_intra + p_div) / (1 - p_div)` (calculator at `scripts/threshold_calc.py`)
+- Adverse selection filters: age-of-opportunity, news-window blackouts, young-market gate
+- Daily report v2 with annualized-return histograms split by strategy
+
+**89 unit tests, all passing**, including replay determinism. CI on Python 3.9 + 3.11.
 
 ## Quick start
 

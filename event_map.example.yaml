@@ -1,0 +1,43 @@
+# Example event map. Hand-write each pair after reading both platforms' rules.
+# DEFAULT trading_enabled: false. Set true only after edge case review is complete.
+# Minimum 5 edge_cases_reviewed entries, at least one with divergent: true.
+
+schema_version: 1
+
+pairs:
+  - pair_id: example-fed-dec-2026-cut
+    polymarket_market_id: "REPLACE-WITH-POLYMARKET-ID"
+    kalshi_market_ticker: "FED-26DEC-CUT"
+    verified_by: "your-name"
+    verified_date: "2026-04-20"
+    trading_enabled: false  # Example only — keep disabled in shipped sample
+    confidence: 0.95
+    topic_tags: [fed, interest_rates]
+
+    edge_cases_reviewed:
+      - scenario: "Standard 25bps cut at meeting"
+        polymarket: "YES"
+        kalshi: "YES"
+        divergent: false
+      - scenario: "Standard 50bps cut at meeting"
+        polymarket: "YES"
+        kalshi: "YES"
+        divergent: false
+      - scenario: "Inter-meeting cut between meetings"
+        polymarket: "NO (not at meeting)"
+        kalshi: "NO"
+        divergent: false
+      - scenario: "Meeting postponed to January"
+        polymarket: "ambiguous"
+        kalshi: "NO (no Dec meeting)"
+        divergent: true
+        mitigation: "Disable pair if postponement is announced; not applicable otherwise"
+      - scenario: "Asymmetric range change (only lower bound drops)"
+        polymarket: "ambiguous (uses 'range')"
+        kalshi: "NO (uses upper bound)"
+        divergent: true
+        mitigation: "Historical Fed behavior makes this <1% likely; accept residual"
+
+    notes: |
+      Example pair. Real configuration should replace the IDs and re-verify the
+      rules text on both platforms before flipping trading_enabled to true.
