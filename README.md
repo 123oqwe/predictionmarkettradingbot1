@@ -2,11 +2,21 @@
 
 Your owned prediction market trading bot.
 
-**Phase 0 + Phase 1**: four-layer architecture, intra-market detection on Polymarket, cross-market detection across Polymarket + Kalshi, adverse-selection filters, paper execution.
+**Phases 0–5 shipped in code. Phases 3–5 frozen pending operator validation.**
+
+| Phase | Status | Gate before enabling |
+|---|---|---|
+| 0 MVP | Ready | — |
+| 1 Dual platform | Ready; event_map must be hand-built | Write `event_map.yaml`, soak 1 week |
+| 2 Risk + reliability | Ready; kill switches in observe mode | 14-day soak with a macro event, flip rules to enforce |
+| 2.5 Backtest | Ready | Read the first census report |
+| 3 Live transition | **Frozen** — needs KYC + funding | Complete Phase 3 decision doc with SCALE |
+| 4 Auto matching | Ready; stub extractor works offline | Validate extractor vs Phase 1 ground truth |
+| 5 Expansion | **Frozen** — all feature flags default OFF | Phase 3 must conclude SCALE first |
 
 See [`docs/README.md`](docs/README.md) for the full 7-phase roadmap.
 
-## What this ships (Phase 0 + Phase 1)
+## What this ships
 
 **Phase 0 — foundations:**
 - Four-layer architecture: data recording, data serving, strategy, execution
@@ -28,7 +38,44 @@ See [`docs/README.md`](docs/README.md) for the full 7-phase roadmap.
 - Adverse selection filters: age-of-opportunity, news-window blackouts, young-market gate
 - Daily report v2 with annualized-return histograms split by strategy
 
-**89 unit tests, all passing**, including replay determinism. CI on Python 3.9 + 3.11.
+**Phase 2 — reliability:**
+- Monitoring layer (MetricsRegistry + SQLite metrics table + Prometheus endpoint)
+- Kill switch framework with observe→enforce modes, per-rule cooldowns
+- 10 rules implemented, every one force-tripped by a test
+- Paper-mode reconciliation (`scripts/reconcile.py`)
+- Telegram alerter with secret redaction + rate limiting
+- Crash recovery + state-loaded gate before first scan
+- Runbook (`docs/runbook.md`) answering all 8 doc questions
+
+**Phase 2.5 — backtesting:**
+- Three fill models (optimistic/realistic/pessimistic) with pessimistic extra-slippage tweak
+- Sharpe using `periods_per_year=365` (asserted by test — prediction markets are 24×7)
+- Backtest runner + A/B comparator + census script
+- Integration test: synthetic Parquet → known PnL, fill-model invariant `opt ≥ real ≥ pes`
+
+**Phase 3 — paper-to-live (FROZEN):**
+- Exchange client ABC + 4-check SafetyGatedClient (live flag + API key env + clean git + not-dry-run)
+- Live executor with two-leg parallel submission + deterministic per-leg client_order_id
+- Partial fill policy: imbalance > 5 → marketable-limit retry @ +50bps × 3 → trip kill switch
+- Uncertainty-bounded model (p05/p95) + calibration coverage stat
+- Three-gate graduation (code-enforced, no silent downgrade)
+- Tax reporting (Section 1256 + ordinary income) with benchmark check
+
+**Phase 4 — auto matching:**
+- Prefilter kills ~99% of cartesian product before LLM
+- ResolutionCriteria schema + controlled edge-case vocabularies per event_type
+- Extractor with STUB/ANTHROPIC/OFFLINE modes; XML-tagged prompt injection guard
+- Parquet cache keyed on (market_id, description_hash, rules_hash, llm_model_version)
+- Deterministic matcher returning explicit `differences` list
+- Tier A/B/C rules in code (C paper-only 48h, auto-promote to B)
+
+**Phase 5 — expansion (FROZEN):**
+- Feature flag system (`/tmp/arb_agent_flags/disable_<name>.flag`) — hot kill, no restart
+- Option E: resolution convergence trading (≥0.95 near-resolution prices, ≥200-contract depth)
+- Capacity diagnostic (`scripts/capacity_report.py`) — capital/edge/latency/attention classifier
+- Expansion proposal template in `docs/`
+
+**204 unit tests, all passing**, including replay determinism, chaos injection, and Phase 5 frozen-by-default. CI on Python 3.9 + 3.11.
 
 ## Quick start
 
