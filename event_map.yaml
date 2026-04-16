@@ -1,0 +1,211 @@
+# Real event_map seeded from a 2026-04-14 scan of both platforms.
+#
+# Methodology used to build this:
+#   1. Pulled 800 Polymarket markets + 1600 Kalshi events (filtered open + non-multi-leg)
+#   2. Searched both for shared topics: Fed, Bitcoin, Trump/Iran, Pope, Mars, IPO
+#   3. Found that as of scan time, most Polymarket Fed markets target April 2026
+#      while Kalshi targets Dec 2026 forward — date mismatch on most direct pairs
+#   4. Selected 5 pairs that demonstrate the structure, ranging from
+#      "verified-but-disabled" to "blocked due to known divergence"
+#
+# YOUR MUST-DO BEFORE TRADING:
+#   - Verify each polymarket_market_id and kalshi_market_ticker is still active
+#   - Re-read the linked rules text on each platform (rules CAN change post-listing)
+#   - For pairs marked trading_enabled: false (all of them) — you flip true
+#   - Consider running scripts/threshold_calc.py to confirm cross-market threshold
+#     matches your latest p_divergence assumption
+
+schema_version: 1
+
+pairs:
+
+  # =========================================================================
+  # PAIR 1: Bitcoin price floor in 2026 — DEMO (verify IDs at trade time)
+  # =========================================================================
+  - pair_id: bitcoin-min-60k-2026
+    polymarket_market_id: "1823780"  # "Will Bitcoin dip to $60,000 in April?" — re-verify for current month
+    kalshi_market_ticker: "KXBTCMINY-27JAN01-60000.00"
+    verified_by: "auto_seed_with_human_review_required"
+    verified_date: "2026-04-14"
+    trading_enabled: false
+    confidence: 0.50
+    topic_tags: [crypto, btc]
+    edge_cases_reviewed:
+      - scenario: "BTC trades below $60k on a major exchange (Coinbase/Binance/Kraken)"
+        polymarket: "YES (depends on Polymarket's settlement source)"
+        kalshi: "YES if intraday low < $60k"
+        divergent: false
+      - scenario: "Single exchange flash crash to $59,999, others stay above"
+        polymarket: "ambiguous — depends on Polymarket source"
+        kalshi: "Kalshi uses CME-derived index; flash crash on a single venue may not move it"
+        divergent: true
+        mitigation: "Block trading on this pair if BTC is within 5% of threshold"
+      - scenario: "Settlement source goes offline"
+        polymarket: "Polymarket uses fallback (typically last known good)"
+        kalshi: "Kalshi has documented fallback in CME methodology"
+        divergent: true
+        mitigation: "Disable pair during major exchange outages"
+      - scenario: "BTC stays above $60k all year"
+        polymarket: "NO"
+        kalshi: "NO"
+        divergent: false
+      - scenario: "Time zone boundary — Asia close vs NY close"
+        polymarket: "Uses UTC by default"
+        kalshi: "Uses ET — different daily window"
+        divergent: false
+        mitigation: "Document, no action — affects timing, not outcome"
+
+  # =========================================================================
+  # PAIR 2: Bitcoin year-end high in 2026
+  # =========================================================================
+  - pair_id: bitcoin-eoy-high-200k-2026
+    polymarket_market_id: "VERIFY_AT_TRADE_TIME"
+    kalshi_market_ticker: "KXBTC2026200-27JAN01-200000"
+    verified_by: "auto_seed_with_human_review_required"
+    verified_date: "2026-04-14"
+    trading_enabled: false
+    confidence: 0.40
+    topic_tags: [crypto, btc, eoy]
+    edge_cases_reviewed:
+      - scenario: "BTC spikes above $200k briefly then retreats"
+        polymarket: "YES (any-time-touched logic typical)"
+        kalshi: "YES if observed once on settlement source"
+        divergent: false
+      - scenario: "BTC reaches $199,999 only — never $200,000"
+        polymarket: "NO"
+        kalshi: "NO"
+        divergent: false
+      - scenario: "Chain split / hard fork creates two BTCs"
+        polymarket: "Uses pre-fork BTC convention"
+        kalshi: "Same"
+        divergent: false
+      - scenario: "Wash trading on small exchange used by Polymarket"
+        polymarket: "May settle YES erroneously"
+        kalshi: "CME index resists single-venue manipulation"
+        divergent: true
+        mitigation: "BLOCK if Polymarket settlement source is a low-volume venue"
+      - scenario: "Both platforms pause trading during regulatory event"
+        polymarket: "May settle to whatever's available"
+        kalshi: "Kalshi pauses trading; resolution may be delayed"
+        divergent: true
+        mitigation: "Halt this pair during any major SEC announcement"
+
+  # =========================================================================
+  # PAIR 3: Fed Dec 2026 rate decision — TEMPLATE for when both have aligned dates
+  # =========================================================================
+  - pair_id: fed-dec-2026-no-change
+    polymarket_market_id: "REPLACE_WITH_DEC_2026_POLY_ID"  # Polymarket lists these closer to date
+    kalshi_market_ticker: "KXFED-26DEC-T4.00"  # 4.00% target — replace with actual current rate level
+    verified_by: "template_for_human_use"
+    verified_date: "2026-04-14"
+    trading_enabled: false
+    confidence: 0.60
+    topic_tags: [fed, interest_rates, macro]
+    notes: |
+      TEMPLATE — Polymarket lists per-meeting Fed markets ~6-12 weeks before
+      meeting date. When Polymarket lists their Dec 2026 markets, replace
+      polymarket_market_id and verify the rate-level target matches your
+      Kalshi pick.
+    edge_cases_reviewed:
+      - scenario: "Standard 25bp move at meeting"
+        polymarket: "Resolves to corresponding bucket"
+        kalshi: "Resolves to specific rate level"
+        divergent: false
+      - scenario: "Inter-meeting emergency cut"
+        polymarket: "NO (not 'at the meeting')"
+        kalshi: "NO if rate at scheduled meeting unchanged from pre-emergency"
+        divergent: false
+      - scenario: "Meeting postponed"
+        polymarket: "Ambiguous — may use 'announcement date' rule"
+        kalshi: "Kalshi resolves on actual statement date"
+        divergent: true
+        mitigation: "Disable pair if any FOMC postponement signal appears"
+      - scenario: "Dovish vs hawkish dot plot but no rate change"
+        polymarket: "NO change → resolves to 'no change' bucket"
+        kalshi: "Same — only the rate level matters"
+        divergent: false
+      - scenario: "Asymmetric range change (only one bound moves)"
+        polymarket: "Ambiguous — Polymarket rules may use 'target range'"
+        kalshi: "Kalshi specifies target rate (single number)"
+        divergent: true
+        mitigation: "Block if any FOMC member signals range-only change"
+
+  # =========================================================================
+  # PAIR 4: Next Pope — BLOCKED (different mechanics)
+  # =========================================================================
+  - pair_id: next-pope-DEMO-BLOCKED
+    polymarket_market_id: "VERIFY_AT_TRADE_TIME"  # Polymarket may not have this
+    kalshi_market_ticker: "KXNEWPOPE-35-PPAR"  # Kalshi has individual candidate markets
+    verified_by: "auto_seed_blocked_due_to_structural_difference"
+    verified_date: "2026-04-14"
+    trading_enabled: false
+    confidence: 0.20
+    topic_tags: [pope, religion]
+    notes: |
+      BLOCKED. Kalshi has per-candidate single-name markets; Polymarket
+      typically lists "next pope" as a multi-outcome market with different
+      candidate set. Resolution mechanic may differ on cardinal name vs.
+      papal name conventions. Documented for completeness, NOT for trading.
+    edge_cases_reviewed:
+      - scenario: "Cardinal Parolin chosen, takes papal name 'Pius XIII'"
+        polymarket: "Resolves YES on the multi-outcome Parolin slot"
+        kalshi: "Resolves YES on the Parolin-specific market"
+        divergent: false
+      - scenario: "Cardinal not in either platform's listed slate elected"
+        polymarket: "Resolves to 'other' bucket"
+        kalshi: "All candidate markets resolve NO; no 'other' bucket"
+        divergent: true
+        mitigation: "BLOCKED — fundamental structural difference"
+      - scenario: "Conclave deadlocks past resolution date"
+        polymarket: "Likely extends or voids"
+        kalshi: "Resolves NO on all candidate markets"
+        divergent: true
+        mitigation: "BLOCKED"
+      - scenario: "Cardinal dies between election and inauguration"
+        polymarket: "Treats as elected"
+        kalshi: "May treat as not-pope"
+        divergent: true
+        mitigation: "BLOCKED"
+      - scenario: "Standard sede vacante → election → new pope"
+        polymarket: "Resolves normally"
+        kalshi: "Resolves normally"
+        divergent: false
+
+  # =========================================================================
+  # PAIR 5: SpaceX/Mars before 2030 — long-horizon, low confidence
+  # =========================================================================
+  - pair_id: spacex-mars-by-2030
+    polymarket_market_id: "VERIFY_AT_TRADE_TIME"  # Polymarket has Mars markets, IDs change
+    kalshi_market_ticker: "KXSPACEXMARS-30"
+    verified_by: "auto_seed_with_human_review_required"
+    verified_date: "2026-04-14"
+    trading_enabled: false
+    confidence: 0.30
+    topic_tags: [space, spacex, mars]
+    notes: |
+      Long-horizon (3+ years to resolution). Cross-platform threshold is
+      meaningless at this duration — annualized return on a multi-year trade
+      is dominated by capital lockup, not edge. Trading_enabled=false until
+      we have edge calculations that handle long-horizon capital-at-risk.
+    edge_cases_reviewed:
+      - scenario: "Successful Mars landing of any SpaceX-developed craft"
+        polymarket: "YES"
+        kalshi: "YES"
+        divergent: false
+      - scenario: "SpaceX is dissolved / merged before 2030"
+        polymarket: "Likely NO (no successful launch attributed)"
+        kalshi: "Same — Kalshi likely tracks the entity"
+        divergent: false
+      - scenario: "Robot/probe lands successfully but humans never go"
+        polymarket: "Depends on rules — 'anything successfully' phrasing"
+        kalshi: "KXSPACEXMARS-30 says 'anything successfully' → YES"
+        divergent: false
+      - scenario: "Crash landing — partial success"
+        polymarket: "NO (typical 'successfully' interpretation)"
+        kalshi: "NO"
+        divergent: false
+      - scenario: "Funding crisis pauses program until 2031"
+        polymarket: "NO at resolution"
+        kalshi: "NO at resolution"
+        divergent: true
+        mitigation: "Both resolve same way; no action needed but flag for accuracy"

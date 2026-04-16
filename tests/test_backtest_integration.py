@@ -53,7 +53,7 @@ def _synthetic_market(idx: int, anchor: datetime, tick_offset_s: int) -> Market:
 
 @pytest.mark.asyncio
 async def test_backtest_end_to_end(tmp_path: Path, strategy_ctx):
-    anchor = datetime(2026, 4, 14, 12, 0, 0, tzinfo=timezone.utc)
+    anchor = datetime.now(timezone.utc).replace(microsecond=0)
     base = tmp_path / "snapshots"
 
     # 3 distinct ticks × 4 markets each = 12 rows.
@@ -88,7 +88,7 @@ async def test_backtest_end_to_end(tmp_path: Path, strategy_ctx):
 @pytest.mark.asyncio
 async def test_backtest_deterministic(tmp_path: Path, strategy_ctx):
     """Two runs on the same Parquet must produce identical determinism_hash."""
-    anchor = datetime(2026, 4, 14, 12, 0, 0, tzinfo=timezone.utc)
+    anchor = datetime.now(timezone.utc).replace(microsecond=0)
     base = tmp_path / "snapshots"
     writer = DailyParquetWriter(base_dir=base, platform="polymarket")
     await writer.write_many([_synthetic_market(i, anchor, 0) for i in range(5)])
@@ -124,7 +124,7 @@ async def test_liquidity_consumed_within_tick(tmp_path: Path, strategy_ctx):
     current strategy, we verify by producing duplicate market_ids in the
     snapshot. That's an edge-case but exercises the consumed-liquidity logic.
     """
-    anchor = datetime(2026, 4, 14, 12, 0, 0, tzinfo=timezone.utc)
+    anchor = datetime.now(timezone.utc).replace(microsecond=0)
     base = tmp_path / "snapshots"
 
     # Build a market with a lot of liquidity (1000 contracts) — if fix #4
@@ -169,7 +169,7 @@ async def test_liquidity_consumed_within_tick(tmp_path: Path, strategy_ctx):
 async def test_pessimistic_produces_fewer_or_smaller_profits(tmp_path: Path, strategy_ctx):
     """Pessimistic fill model must produce PnL <= realistic <= optimistic for
     the same inputs. This is the honest-fill invariant."""
-    anchor = datetime(2026, 4, 14, 12, 0, 0, tzinfo=timezone.utc)
+    anchor = datetime.now(timezone.utc).replace(microsecond=0)
     base = tmp_path / "snapshots"
     writer = DailyParquetWriter(base_dir=base, platform="polymarket")
     # Use a two-level book so pessimistic has something to "drop into".

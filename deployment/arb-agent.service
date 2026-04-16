@@ -1,0 +1,53 @@
+# systemd unit for Linux deployments.
+#
+# Installation (one-time):
+#   1. Edit this file — replace REPLACE_REPO_PATH and REPLACE_USER
+#   2. Copy: sudo cp deployment/arb-agent.service /etc/systemd/system/
+#   3. Reload: sudo systemctl daemon-reload
+#   4. Enable on boot: sudo systemctl enable arb-agent
+#   5. Start: sudo systemctl start arb-agent
+#   6. Verify: sudo systemctl status arb-agent
+#               curl http://127.0.0.1:9100/health
+#
+# Controls:
+#   Stop:       sudo systemctl stop arb-agent
+#   Restart:    sudo systemctl restart arb-agent
+#   Logs:       sudo journalctl -u arb-agent -f
+#   Emergency:  touch /tmp/arb_agent.kill
+
+[Unit]
+Description=Prediction market arbitrage agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=REPLACE_USER
+WorkingDirectory=REPLACE_REPO_PATH
+ExecStart=REPLACE_REPO_PATH/.venv/bin/python -m src.main --config REPLACE_REPO_PATH/config.yaml
+
+# Restart policy: restart on any non-zero exit, max 5 times per 60s to avoid
+# fast crash loops. systemd itself won't prevent the tracked kill switch, but
+# it does keep the process alive through network blips.
+Restart=on-failure
+RestartSec=10
+StartLimitInterval=60
+StartLimitBurst=5
+
+# Hardening. Revisit if you add MCP servers or other IPC.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=REPLACE_REPO_PATH/data REPLACE_REPO_PATH/logs
+ProtectHome=read-only
+PrivateTmp=false  # false so /tmp/arb_agent.kill works for manual halt
+
+# Environment: set API keys here only AFTER KYC + funding. Without them the
+# orchestrator runs in paper mode. Consider using EnvironmentFile= pointing
+# to a root-owned file with 0600 perms to keep secrets off-disk in this unit.
+# EnvironmentFile=/etc/arb-agent.env
+
+StandardOutput=append:REPLACE_REPO_PATH/logs/orchestrator.log
+StandardError=append:REPLACE_REPO_PATH/logs/orchestrator.err
+
+[Install]
+WantedBy=multi-user.target

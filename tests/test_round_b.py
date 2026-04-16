@@ -202,7 +202,8 @@ class TestStreamingReplay:
         base = tmp_path / "snapshots"
         writer = DailyParquetWriter(base_dir=base, platform="polymarket")
 
-        anchor = datetime(2026, 4, 14, 12, 0, 0, tzinfo=timezone.utc)
+        # anchor = now() so writer's today-based file matches synthetic fetched_at.
+        anchor = datetime.now(timezone.utc).replace(microsecond=0)
 
         def _m(ts, i):
             return Market(

@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS launchd unit for the arb-agent orchestrator.
+
+  Installation (one-time):
+    1. Edit this file — replace REPLACE_REPO_PATH with the absolute path to
+       your clone of predictionmarkettradingbot1 (e.g., /Users/you/projects/...)
+    2. Copy to ~/Library/LaunchAgents/:
+         cp deployment/com.arbagent.orchestrator.plist \
+            ~/Library/LaunchAgents/
+    3. Load it:
+         launchctl load ~/Library/LaunchAgents/com.arbagent.orchestrator.plist
+    4. Verify it's running:
+         launchctl list | grep arbagent
+         curl http://127.0.0.1:9100/health
+
+  The agent will start on login and restart if it crashes.
+
+  Controls:
+    Stop:      launchctl unload ~/Library/LaunchAgents/com.arbagent.orchestrator.plist
+    Restart:   launchctl kickstart -k gui/$(id -u)/com.arbagent.orchestrator
+    Logs:      tail -f REPLACE_REPO_PATH/logs/orchestrator.log
+    Metrics:   curl http://127.0.0.1:9100/metrics
+    Emergency: touch /tmp/arb_agent.kill  (stops trading, recording continues)
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.arbagent.orchestrator</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>REPLACE_REPO_PATH/.venv/bin/python</string>
+        <string>-m</string>
+        <string>src.main</string>
+        <string>--config</string>
+        <string>REPLACE_REPO_PATH/config.yaml</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>REPLACE_REPO_PATH</string>
+
+    <key>StandardOutPath</key>
+    <string>REPLACE_REPO_PATH/logs/orchestrator.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>REPLACE_REPO_PATH/logs/orchestrator.err</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- Set API keys here ONLY after KYC + funding.
+             Use `launchctl setenv KEY value` instead if you prefer not to
+             persist secrets in this file (which you probably don't).
+             When unset, orchestrator runs in paper mode (safe). -->
+        <!-- <key>POLYMARKET_API_KEY</key><string>xxx</string> -->
+        <!-- <key>KALSHI_API_KEY</key><string>xxx</string> -->
+        <!-- <key>TELEGRAM_BOT_TOKEN</key><string>xxx</string> -->
+        <!-- <key>TELEGRAM_CHAT_ID</key><string>xxx</string> -->
+        <!-- <key>ANTHROPIC_API_KEY</key><string>xxx</string> -->
+    </dict>
+</dict>
+</plist>

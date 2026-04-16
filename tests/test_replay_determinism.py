@@ -66,7 +66,9 @@ def _synthetic_markets(anchor: datetime, count: int, tick_offset_s: int) -> List
 async def test_replay_is_deterministic(tmp_path: Path, strategy_ctx):
     base_dir = tmp_path / "snapshots"
 
-    anchor = datetime(2026, 4, 14, 12, 0, 0, tzinfo=timezone.utc)
+    # NB: anchor = now() so the writer's today-based file path matches the
+    # synthetic markets' fetched_at dates.
+    anchor = datetime.now(timezone.utc).replace(microsecond=0)
     # 3 ticks of 20 markets each → 60 rows.
     tick0 = _synthetic_markets(anchor, count=20, tick_offset_s=0)
     tick1 = _synthetic_markets(anchor, count=20, tick_offset_s=5)
@@ -99,9 +101,14 @@ async def test_replay_is_deterministic(tmp_path: Path, strategy_ctx):
 
 @pytest.mark.asyncio
 async def test_replay_emits_per_tick_groups(tmp_path: Path, strategy_ctx):
-    """Replay should group snapshots by fetched_at; each tick yields a batch."""
+    """Replay should group snapshots by fetched_at; each tick yields a batch.
+
+    NB: synthetic markets use `datetime.now()` as the anchor so the writer's
+    today-based file path matches (writer chooses filename from wall-clock,
+    not from the markets' fetched_at).
+    """
     base_dir = tmp_path / "snapshots"
-    anchor = datetime(2026, 4, 14, 12, 0, 0, tzinfo=timezone.utc)
+    anchor = datetime.now(timezone.utc).replace(microsecond=0)
     t0 = _synthetic_markets(anchor, count=5, tick_offset_s=0)
     t1 = _synthetic_markets(anchor, count=5, tick_offset_s=5)
 
